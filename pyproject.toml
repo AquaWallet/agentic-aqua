@@ -1,0 +1,78 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentic-aqua"
+dynamic = ["version"]
+description = "Agentic AQUA — MCP server for Liquid Network and Bitcoin wallet operations"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.13,<3.14"
+authors = [
+    { name = "Andy", email = "andy@jan3.com" }
+]
+keywords = ["liquid", "bitcoin", "wallet", "mcp", "ai", "lwk", "blockstream"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3 :: Only",
+]
+
+dependencies = [
+    "lwk>=0.20.0",
+    "mcp>=1.30.0,<2",
+    "cryptography>=50.0.0",
+    "bdkpython>=3.1.1,<4",
+    "coincurve>=21.0.0",
+    "python-dotenv>=1.0.0",
+    "click>=8.1",
+    "websockets>=12.0",
+    "pillow>=13.0",
+    "zxing-cpp>=2.2",
+    "qrcode[pil]>=7.0",
+    "wallycore>=1.5.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-asyncio>=0.23.0",
+    "black>=26.10.1",
+    "ruff>=0.2.0",
+    "pytest-cov>=7.0.0",
+]
+
+[project.scripts]
+aqua = "aqua.cli.main:cli"
+aqua-mcp = "aqua.server:main"
+agentic-aqua = "aqua.server:main"
+
+[project.urls]
+Homepage = "https://github.com/AquaWallet/agentic-aqua"
+Repository = "https://github.com/AquaWallet/agentic-aqua"
+Documentation = "https://github.com/AquaWallet/agentic-aqua#readme"
+
+[tool.hatch.version]
+path = "src/aqua/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aqua"]
+
+[tool.black]
+line-length = 100
+target-version = ["py313"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

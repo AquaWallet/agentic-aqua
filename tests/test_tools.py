@@ -1,0 +1,2113 @@
+"""Tests for all MCP tool functions exposed by the liquid wallet server."""
+
+import json
+import time
+import tempfile
+import urllib.error
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import lwk
+import pytest
+
+from aqua.bitcoin import BitcoinWalletManager
+from aqua.storage import Storage, WalletData
+from aqua.qr import decode_qr
+from aqua.tools import (
+    ESPLORA_URLS,
+    _attach_deposit_qr,
+    _esplora_bases,
+    _manager,
+    _parse_tx_input,
+    btc_address,
+    btc_export_descriptor,
+    btc_import_descriptor,
+    changelly_send,
+    delete_wallet,
+    get_btc_manager,
+    get_manager,
+    lw_address,
+    lw_backup_mnemonic,
+    lw_balance,
+    lw_create_wallet,
+    lw_sweep,
+    lw_export_descriptor,
+    lw_import_descriptor,
+    lw_import_mnemonic,
+    lw_list_wallets,
+    lw_send,
+    lw_send_asset,
+    lw_transactions,
+    lw_tx_status,
+)
+from aqua.wallet import LIQUID_BACKEND_URLS, WalletManager
+
+from tests.conftest import TEST_MNEMONIC
+
+
+@pytest.fixture(autouse=True)
+def isolated_manager():
+    """Replace the global manager with one using a temp directory for every test."""
+    import aqua.tools as tools_module
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        storage = Storage(Path(tmpdir))
+        manager = WalletManager(storage=storage)
+        tools_module._manager = manager
+        tools_module._btc_manager = None  # so get_btc_manager() uses same storage
+        tools_module._lightning_manager = None
+        tools_module._jan3_manager = None
+        tools_module._pix_manager = None
+        yield manager
+        tools_module._manager = None
+        tools_module._btc_manager = None
+        tools_module._lightning_manager = None
+        tools_module._jan3_manager = None
+        tools_module._pix_manager = None
+
+
+# ---------------------------------------------------------------------------
+# lw_create_wallet / lw_backup_mnemonic: the seed never leaves the process
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def known_seed():
+    """Make seed generation deterministic so leaks can be detected."""
+    with patch.object(WalletManager, "generate_mnemonic", return_value=TEST_MNEMONIC):
+        yield TEST_MNEMONIC
+
+
+class TestCreateWallet:
+    def test_generate_mnemonic_not_an_mcp_tool(self):
+        from aqua.server import TOOL_SCHEMAS
+        from aqua.tools import TOOLS
+
+        assert "lw_generate_mnemonic" not in TOOLS
+        assert "lw_generate_mnemonic" not in TOOL_SCHEMAS
+        assert "lw_create_wallet" in TOOLS and "lw_create_wallet" in TOOL_SCHEMAS
+        assert "lw_backup_mnemonic" in TOOLS and "lw_backup_mnemonic" in TOOL_SCHEMAS
+
+    def test_creates_wallet_without_returning_seed(self, isolated_manager, known_seed):
+        result = lw_create_wallet(wallet_name="fresh")
+
+        assert "mnemonic" not in result
+        dumped = json.dumps(result)
+        assert not any(w in dumped for w in set(known_seed.split()) - {"tuna"})
+        assert known_seed not in dumped
+        assert result["wallet_name"] == "fresh"
+        assert result["watch_only"] is False
+        assert result["btc_descriptor"]
+        assert "backup" in result["backup_recommendation"].lower()
+        assert "lw_backup_mnemonic" in result["backup_recommendation"]
+        assert isolated_manager.storage.wallet_exists("fresh")
+
+    def test_writes_no_backup_file(self, isolated_manager, known_seed):
+        lw_create_wallet(wallet_name="fresh")
+        assert not (isolated_manager.storage.base_dir / "backups").exists()
+
+    def test_password_encrypts_at_rest(self, isolated_manager, known_seed):
+        lw_create_wallet(wallet_name="enc", password="pw")
+        stored = isolated_manager.storage.load_wallet("enc").encrypted_mnemonic
+        assert stored.startswith("user:")
+
+    def test_duplicate_name_rejected(self, known_seed):
+        lw_create_wallet(wallet_name="dup")
+        with pytest.raises(ValueError, match="already exists"):
+            lw_create_wallet(wallet_name="dup")
+
+    @pytest.mark.asyncio
+    async def test_mcp_dispatch_does_not_leak_seed(self, known_seed):
+        import mcp.types as types
+        from mcp.server import Server
+
+        from aqua.server import _make_handlers
+        from aqua.storage import Config
+
+        server = Server("test")
+        _make_handlers(server, Config())
+        handler = server.request_handlers[types.CallToolRequest]
+        res = await handler(
+            types.CallToolRequest(
+                method="tools/call",
+                params=types.CallToolRequestParams(
+                    name="lw_create_wallet", arguments={"wallet_name": "mcp"}
+                ),
+            )
+        )
+        text = res.root.content[0].text
+        assert "wallet_name" in text and "mcp" in text
+        assert known_seed not in text and "twelve" not in text
+
+
+class TestBackupMnemonic:
+    def test_writes_private_file_without_returning_seed(self, isolated_manager, known_seed):
+        lw_create_wallet(wallet_name="bk")
+        result = lw_backup_mnemonic(wallet_name="bk")
+
+        path = Path(result["backup_path"])
+        assert path == isolated_manager.storage.base_dir / "backups" / "bk-mnemonic.txt"
+        assert path.read_text() == known_seed + "\n"
+        assert "twelve" not in json.dumps(result)
+        assert "plain text" in result["warning"]
+        assert result["wallet_name"] == "bk"
+        assert (path.stat().st_mode & 0o777) == 0o600
+        assert (path.parent.stat().st_mode & 0o777) == 0o700
+        assert not list(path.parent.glob("*.tmp"))
+
+    def test_overwrites_existing_backup(self, isolated_manager, known_seed):
+        lw_create_wallet(wallet_name="bk")
+        first = lw_backup_mnemonic(wallet_name="bk")
+        Path(first["backup_path"]).write_text("stale")
+        second = lw_backup_mnemonic(wallet_name="bk")
+        assert Path(second["backup_path"]).read_text() == known_seed + "\n"
+
+    def test_encrypted_wallet_requires_password(self, known_seed):
+        lw_create_wallet(wallet_name="enc", password="pw")
+        with pytest.raises(ValueError, match="(?i)password required"):
+            lw_backup_mnemonic(wallet_name="enc")
+        result = lw_backup_mnemonic(wallet_name="enc", password="pw")
+        assert Path(result["backup_path"]).read_text() == known_seed + "\n"
+
+    def test_watch_only_wallet_raises(self, isolated_manager):
+        descriptor = isolated_manager.import_mnemonic(TEST_MNEMONIC, "src").descriptor
+        lw_import_descriptor(descriptor=descriptor, wallet_name="wo")
+        with pytest.raises(ValueError, match="watch-only"):
+            lw_backup_mnemonic(wallet_name="wo")
+
+    def test_missing_wallet_raises(self):
+        with pytest.raises(ValueError, match="not found"):
+            lw_backup_mnemonic(wallet_name="nope")
+
+    def test_rejects_path_traversal_name(self):
+        with pytest.raises(ValueError):
+            lw_backup_mnemonic(wallet_name="../evil")
+
+
+# ---------------------------------------------------------------------------
+# lw_import_mnemonic  # Significance: 5 (Essential)
+# ---------------------------------------------------------------------------
+
+
+class TestImportMnemonic:
+    def test_import_creates_wallet(self):
+        """Importing a mnemonic returns wallet metadata and persists it."""
+        result = lw_import_mnemonic(
+            mnemonic=TEST_MNEMONIC,
+            wallet_name="test_wallet",
+            network="mainnet",
+        )
+
+        assert result["wallet_name"] == "test_wallet"
+        assert result["network"] == "mainnet"
+        assert result["watch_only"] is False
+        assert result["descriptor"].startswith("ct(")
+
+    def test_import_with_testnet(self):
+        """Importing on testnet records the correct network."""
+        result = lw_import_mnemonic(
+            mnemonic=TEST_MNEMONIC,
+            wallet_name="testnet_wallet",
+            network="testnet",
+        )
+        assert result["network"] == "testnet"
+
+    def test_import_with_password_encrypts(self, isolated_manager):
+        """When a password is given the mnemonic is stored encrypted."""
+        lw_import_mnemonic(
+            mnemonic=TEST_MNEMONIC,
+            wallet_name="enc_wallet",
+            password="s3cret",
+        )
+
+        wallet = isolated_manager.storage.load_wallet("enc_wallet")
+        assert wallet.encrypted_mnemonic is not None
+        assert wallet.encrypted_mnemonic != TEST_MNEMONIC
+
+    def test_import_duplicate_raises(self):
+        """Importing the same wallet name twice raises ValueError."""  # Significance: 4
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="dup")
+
+        with pytest.raises(ValueError, match="already exists"):
+            lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="dup")
+
+    def test_import_invalid_mnemonic_raises(self):
+        """An invalid mnemonic is rejected by lwk."""  # Significance: 4
+        with pytest.raises(Exception):
+            lw_import_mnemonic(mnemonic="not a valid mnemonic phrase", wallet_name="bad")
+
+
+# ---------------------------------------------------------------------------
+# lw_import_descriptor  # Significance: 5 (Essential)
+# ---------------------------------------------------------------------------
+
+
+class TestImportDescriptor:
+    def _get_descriptor(self) -> str:
+        """Helper: generate a valid descriptor from a mnemonic."""
+        net = lwk.Network.mainnet()
+        m = lwk.Mnemonic(TEST_MNEMONIC)
+        signer = lwk.Signer(m, net)
+        return str(signer.wpkh_slip77_descriptor())
+
+    def test_import_creates_watch_only(self):
+        """Importing a descriptor creates a watch-only wallet."""
+        desc = self._get_descriptor()
+        result = lw_import_descriptor(
+            descriptor=desc,
+            wallet_name="watch",
+            network="mainnet",
+        )
+
+        assert result["wallet_name"] == "watch"
+        assert result["watch_only"] is True
+        assert result["network"] == "mainnet"
+
+    def test_import_descriptor_duplicate_raises(self):
+        """Duplicate wallet name raises."""  # Significance: 4
+        desc = self._get_descriptor()
+        lw_import_descriptor(descriptor=desc, wallet_name="dup_wo")
+
+        with pytest.raises(ValueError, match="already exists"):
+            lw_import_descriptor(descriptor=desc, wallet_name="dup_wo")
+
+
+# ---------------------------------------------------------------------------
+# lw_export_descriptor  # Significance: 4 (Important)
+# ---------------------------------------------------------------------------
+
+
+class TestExportDescriptor:
+    def test_export_returns_descriptor(self):
+        """Exporting a wallet's descriptor returns the original one."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="exp")
+        result = lw_export_descriptor(wallet_name="exp")
+
+        assert result["wallet_name"] == "exp"
+        assert result["descriptor"].startswith("ct(")
+
+    def test_export_roundtrip(self):
+        """Exported descriptor matches what was stored at import time."""
+        import_result = lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="rt")
+        export_result = lw_export_descriptor(wallet_name="rt")
+
+        assert import_result["descriptor"] == export_result["descriptor"]
+
+    def test_export_nonexistent_raises(self):
+        """Exporting from a non-existent wallet raises."""  # Significance: 4
+        with pytest.raises(ValueError, match="not found"):
+            lw_export_descriptor(wallet_name="ghost")
+
+
+# ---------------------------------------------------------------------------
+# lw_list_wallets  # Significance: 4 (Important)
+# ---------------------------------------------------------------------------
+
+
+class TestListWallets:
+    def test_empty_initially(self):
+        """No wallets listed before any import."""
+        result = lw_list_wallets()
+        assert result["wallets"] == []
+        assert result["count"] == 0
+
+    def test_lists_imported_wallets(self):
+        """All imported wallets appear in the listing."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="w1")
+
+        net = lwk.Network.mainnet()
+        m = lwk.Mnemonic(TEST_MNEMONIC)
+        signer = lwk.Signer(m, net)
+        desc = str(signer.wpkh_slip77_descriptor())
+        lw_import_descriptor(descriptor=desc, wallet_name="w2")
+
+        result = lw_list_wallets()
+        assert set(result["wallets"]) == {"w1", "w2"}
+        assert result["count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# lw_address  # Significance: 5 (Essential)
+# ---------------------------------------------------------------------------
+
+
+class TestAddress:
+    def test_generates_address(self):
+        """Generates a valid Liquid address with an index."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="addr_test")
+        result = lw_address(wallet_name="addr_test")
+
+        assert "address" in result
+        assert "index" in result
+        assert isinstance(result["index"], int)
+        assert len(result["address"]) > 0
+
+    def test_address_is_confidential(self):
+        """Generated addresses should be confidential (lq1 or VJL prefix)."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="conf_test")
+        result = lw_address(wallet_name="conf_test")
+        addr = result["address"]
+        assert addr.startswith("lq1") or addr.startswith("VJL") or addr.startswith("VTp")
+
+    def test_no_index_is_idempotent(self):
+        """Repeated no-index calls show the SAME address (read-only display peek).
+
+        lw_address is a pure display path: it must not advance the counter, so
+        re-showing "my address" returns the same one until it is funded.
+        """
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="peek_test")
+        r1 = lw_address(wallet_name="peek_test")
+        r2 = lw_address(wallet_name="peek_test")
+        assert r1["address"] == r2["address"]
+        assert r1["index"] == r2["index"]
+
+    def test_specific_index(self):
+        """Requesting a specific index returns that index."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="idx_test")
+        result = lw_address(wallet_name="idx_test", index=0)
+        assert result["index"] == 0
+
+    def test_same_index_same_address(self):
+        """Same index always produces the same address."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="det_test")
+        r1 = lw_address(wallet_name="det_test", index=0)
+        r2 = lw_address(wallet_name="det_test", index=0)
+        assert r1["address"] == r2["address"]
+
+    def test_different_index_different_address(self):
+        """Different indexes produce different addresses."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="diff_test")
+        r0 = lw_address(wallet_name="diff_test", index=0)
+        r1 = lw_address(wallet_name="diff_test", index=1)
+        assert r0["address"] != r1["address"]
+
+    def test_nonexistent_wallet_raises(self):
+        """Address request for non-existent wallet raises."""  # Significance: 4
+        with pytest.raises(ValueError, match="not found"):
+            lw_address(wallet_name="nope")
+
+
+# ---------------------------------------------------------------------------
+# Deposit-address QR codes (issue #69)  # Significance: 4
+# ---------------------------------------------------------------------------
+
+
+class TestDepositQr:
+    """_attach_deposit_qr is the shared seam wired into every receive tool."""
+
+    def test_attaches_path_that_decodes_back(self):
+        data = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq"
+        result = _attach_deposit_qr({"deposit_address": data}, "deposit_address")
+
+        assert "qr_error" not in result
+        path = result["qr_code_path"]
+        assert Path(path).is_file()
+        assert decode_qr(path) == data
+
+    def test_qr_written_under_storage_qr_dir(self):
+        addr = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq"
+        result = _attach_deposit_qr({"address": addr}, "address")
+        qr_dir = get_manager().storage.qr_dir
+        assert Path(result["qr_code_path"]).parent == qr_dir.resolve()
+
+    def test_encode_transform_changes_qr_payload_only(self):
+        """BOLT11 path: QR encodes the uppercase form; stored field stays as-is."""
+        invoice = "lnbc1000u1ptest123"
+        result = _attach_deposit_qr({"invoice": invoice}, "invoice", encode_transform=str.upper)
+
+        assert result["invoice"] == invoice  # stored value untouched
+        assert decode_qr(result["qr_code_path"]) == invoice.upper()
+
+    def test_missing_or_empty_key_is_noop(self):
+        assert _attach_deposit_qr({"other": "x"}, "address") == {"other": "x"}
+        assert _attach_deposit_qr({"address": ""}, "address") == {"address": ""}
+
+    def test_generation_failure_reports_qr_error_not_fake_success(self, monkeypatch):
+        """If QR generation fails, the address survives and qr_error is set."""
+        import aqua.tools as tools_module
+
+        def boom(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(tools_module, "generate_qr", boom)
+        result = _attach_deposit_qr({"address": "bc1qexample"}, "address")
+
+        assert result["address"] == "bc1qexample"
+        assert "qr_code_path" not in result
+        assert "disk full" in result["qr_error"]
+
+    def test_lw_address_includes_decodable_qr(self):
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="qr_lw")
+        result = lw_address(wallet_name="qr_lw")
+
+        assert decode_qr(result["qr_code_path"]) == result["address"]
+
+    def test_btc_address_includes_decodable_qr(self):
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="qr_btc")
+        result = btc_address(wallet_name="qr_btc")
+
+        assert decode_qr(result["qr_code_path"]) == result["address"]
+
+    @patch("aqua.tools.get_sideshift_manager")
+    def test_sideshift_memo_shift_adds_qr_warning(self, mock_get_mgr):
+        """Memo-based deposit chains: QR is address-only, so warn loudly."""
+        import aqua.tools as tools_module
+
+        shift = MagicMock()
+        shift.to_dict.return_value = {
+            "shift_id": "s1",
+            "deposit_address": "bnb1qexampledepositaddress",
+            "deposit_memo": "987654321",
+            "settle_address": "lq1qsettle",
+            "status": "waiting",
+        }
+        fake = MagicMock()
+        fake.receive_shift.return_value = shift
+        mock_get_mgr.return_value = fake
+
+        result = tools_module.sideshift_receive(
+            deposit_coin="usdt", deposit_network="bsc",
+            settle_coin="usdt", settle_network="liquid",
+        )
+
+        assert "qr_code_path" in result
+        assert "qr_warning" in result
+        assert "987654321" in result["qr_warning"]
+        assert "memo" in result["qr_warning"].lower()
+
+    @patch("aqua.tools.get_sideshift_manager")
+    def test_sideshift_without_memo_has_no_warning(self, mock_get_mgr):
+        import aqua.tools as tools_module
+
+        shift = MagicMock()
+        shift.to_dict.return_value = {
+            "shift_id": "s2",
+            "deposit_address": "bc1qexampledepositaddress",
+            "settle_address": "lq1qsettle",
+            "status": "waiting",
+        }
+        fake = MagicMock()
+        fake.receive_shift.return_value = shift
+        mock_get_mgr.return_value = fake
+
+        result = tools_module.sideshift_receive(
+            deposit_coin="btc", deposit_network="bitcoin",
+            settle_coin="usdt", settle_network="liquid",
+        )
+
+        assert "qr_code_path" in result
+        assert "qr_warning" not in result
+
+
+# ---------------------------------------------------------------------------
+# lw_balance  # Significance: 5 (Essential)
+# ---------------------------------------------------------------------------
+
+
+class TestBalance:
+    def test_balance_response_structure(self, isolated_manager):
+        """Balance returns the expected response structure."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="bal_test")
+
+        with patch.object(isolated_manager, "sync_wallet"):
+            result = lw_balance(wallet_name="bal_test")
+
+        assert result["wallet_name"] == "bal_test"
+        assert "balances" in result
+        assert isinstance(result["balances"], list)
+
+    def test_balance_labels_lbtc(self, isolated_manager):
+        """The policy asset is labeled 'L-BTC'."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="label_test")
+
+        policy_asset = str(lwk.Network.mainnet().policy_asset())
+        mock_balance = {policy_asset: 5000}
+
+        wollet = isolated_manager._get_wollet("label_test")
+        with (
+            patch.object(isolated_manager, "sync_wallet"),
+            patch.object(wollet, "balance", return_value=mock_balance),
+        ):
+            result = lw_balance(wallet_name="label_test")
+
+        lbtc = [b for b in result["balances"] if b["ticker"] == "L-BTC"]
+        assert len(lbtc) == 1
+        assert lbtc[0]["amount_sats"] == 5000
+
+    def test_balance_non_lbtc_asset_truncated_name(self, isolated_manager):
+        """Non-L-BTC assets get a truncated name (first 8 chars + '...')."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="trunc_test")
+
+        fake_asset = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+        mock_balance = {fake_asset: 100}
+
+        wollet = isolated_manager._get_wollet("trunc_test")
+        with (
+            patch.object(isolated_manager, "sync_wallet"),
+            patch.object(wollet, "balance", return_value=mock_balance),
+        ):
+            result = lw_balance(wallet_name="trunc_test")
+
+        asset_entry = result["balances"][0]
+        assert asset_entry["asset_name"] == "abcdef12..."
+        assert asset_entry["amount_sats"] == 100
+
+    def test_balance_nonexistent_wallet_raises(self):
+        """Balance for non-existent wallet raises."""  # Significance: 4
+        with pytest.raises(ValueError, match="not found"):
+            lw_balance(wallet_name="ghost")
+
+
+# ---------------------------------------------------------------------------
+# lw_transactions  # Significance: 4 (Important)
+# ---------------------------------------------------------------------------
+
+
+class TestTransactions:
+    def test_transactions_response_structure(self, isolated_manager):
+        """Transactions response has the expected keys."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="tx_test")
+
+        wollet = isolated_manager._get_wollet("tx_test")
+        with (
+            patch.object(isolated_manager, "sync_wallet"),
+            patch.object(wollet, "transactions", return_value=[]),
+        ):
+            result = lw_transactions(wallet_name="tx_test")
+
+        assert result["wallet_name"] == "tx_test"
+        assert result["transactions"] == []
+        assert result["count"] == 0
+
+    def test_transactions_with_mock_data(self, isolated_manager):
+        """Transaction list is properly serialized."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="txdata_test")
+
+        policy_asset = str(lwk.Network.mainnet().policy_asset())
+
+        mock_tx = MagicMock()
+        mock_tx.txid.return_value = "abc123"
+        mock_tx.height.return_value = 100
+        mock_tx.timestamp.return_value = 1700000000
+        mock_tx.balance.return_value = {policy_asset: -500}
+        mock_tx.fee.return_value = 250
+
+        wollet = isolated_manager._get_wollet("txdata_test")
+        with (
+            patch.object(isolated_manager, "sync_wallet"),
+            patch.object(wollet, "transactions", return_value=[mock_tx]),
+        ):
+            result = lw_transactions(wallet_name="txdata_test")
+
+        assert result["count"] == 1
+        tx = result["transactions"][0]
+        assert tx["txid"] == "abc123"
+        assert tx["height"] == 100
+        assert tx["timestamp"] == 1700000000
+        assert tx["fee"] == 250
+        assert "L-BTC" in tx["balance"]
+        assert tx["balance"]["L-BTC"]["asset_id"] == policy_asset
+
+    def test_transactions_respects_limit(self, isolated_manager):
+        """Only `limit` transactions are returned."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="lim_test")
+
+
+        def make_mock_tx(txid):
+            tx = MagicMock()
+            tx.txid.return_value = txid
+            tx.height.return_value = 1
+            tx.timestamp.return_value = 1
+            tx.balance.return_value = {}
+            tx.fee.return_value = 0
+            return tx
+
+        mock_txs = [make_mock_tx(f"tx{i}") for i in range(5)]
+
+        wollet = isolated_manager._get_wollet("lim_test")
+        with (
+            patch.object(isolated_manager, "sync_wallet"),
+            patch.object(wollet, "transactions", return_value=mock_txs),
+        ):
+            result = lw_transactions(wallet_name="lim_test", limit=2)
+
+        assert result["count"] == 2
+
+    def test_transactions_nonexistent_wallet_raises(self):
+        """Transactions for non-existent wallet raises."""  # Significance: 4
+        with pytest.raises(ValueError, match="not found"):
+            lw_transactions(wallet_name="ghost")
+
+
+# ---------------------------------------------------------------------------
+# lw_send  # Significance: 5 (Essential)
+# ---------------------------------------------------------------------------
+
+
+class TestSend:
+    DEST_ADDRESS = "lq1qqvxk052kf3qtkxmrakx50a9gc3smqad2ync54hzntjt980kfej9kkfe0247rp5h4yzmdftsahhw64uy8pzfe7cpg4fgykm7cv"
+
+    def _setup_send_mocks(self, isolated_manager, wallet_name):
+        """Helper: set up mocks for send tests, returns (mock_builder, mock_client)."""
+        mock_builder = MagicMock()
+        mock_pset = MagicMock()
+        mock_signed = MagicMock()
+        mock_tx = MagicMock()
+        mock_client = MagicMock()
+        mock_net = MagicMock()
+
+        mock_net.tx_builder.return_value = mock_builder
+        mock_builder.finish.return_value = mock_pset
+        isolated_manager._signers[wallet_name].sign = MagicMock(return_value=mock_signed)
+        mock_signed.finalize.return_value = mock_tx
+
+        # Pre-populate wollet cache with a mock so _get_wollet doesn't call _get_network
+        isolated_manager._wollets[wallet_name] = MagicMock()
+
+        return mock_builder, mock_client, mock_net
+
+    def test_send_success(self, isolated_manager):
+        """Send returns txid on success."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="send_test")
+        mock_builder, mock_client, mock_net = self._setup_send_mocks(isolated_manager, "send_test")
+        mock_client.broadcast.return_value = "txid_abc123"
+
+        with (
+            patch.object(isolated_manager, "sync_wallet"),
+            patch.object(isolated_manager, "_get_network", return_value=mock_net),
+            patch.object(isolated_manager, "_get_client", return_value=mock_client),
+        ):
+            result = lw_send(
+                wallet_name="send_test",
+                address=self.DEST_ADDRESS,
+                amount=1000,
+            )
+
+        assert result["txid"] == "txid_abc123"
+        assert result["amount"] == 1000
+        assert result["address"] == self.DEST_ADDRESS
+
+    def test_send_builds_lbtc_recipient_with_lwk_address(self, isolated_manager):
+        """Send converts string address to lwk.Address for add_lbtc_recipient."""  # Significance: 5
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="addr_conv")
+        mock_builder, mock_client, mock_net = self._setup_send_mocks(isolated_manager, "addr_conv")
+        mock_client.broadcast.return_value = "ok"
+
+        with (
+            patch.object(isolated_manager, "sync_wallet"),
+            patch.object(isolated_manager, "_get_network", return_value=mock_net),
+            patch.object(isolated_manager, "_get_client", return_value=mock_client),
+        ):
+            lw_send(wallet_name="addr_conv", address=self.DEST_ADDRESS, amount=500)
+
+        call_args = mock_builder.add_lbtc_recipient.call_args
+        address_arg = call_args[0][0]
+        assert isinstance(address_arg, lwk.Address)
+
+    def test_send_from_watch_only_raises(self, isolated_manager):
+        """Cannot send from a watch-only wallet."""  # Significance: 5
+        net = lwk.Network.mainnet()
+        m = lwk.Mnemonic(TEST_MNEMONIC)
+        signer = lwk.Signer(m, net)
+        desc = str(signer.wpkh_slip77_descriptor())
+
+        lw_import_descriptor(descriptor=desc, wallet_name="wo_send")
+
+        with pytest.raises(ValueError, match="watch-only"):
+            lw_send(wallet_name="wo_send", address=self.DEST_ADDRESS, amount=100)
+
+    def test_send_nonexistent_wallet_raises(self):
+        """Send from non-existent wallet raises."""  # Significance: 4
+        with pytest.raises(ValueError, match="not found"):
+            lw_send(wallet_name="ghost", address=self.DEST_ADDRESS, amount=100)
+
+    def test_send_zero_amount_raises(self):
+        """Sending zero satoshis raises ValueError."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="zero_send")
+        with pytest.raises(ValueError, match="Amount must be positive"):
+            lw_send(wallet_name="zero_send", address=self.DEST_ADDRESS, amount=0)
+
+    def test_send_negative_amount_raises(self):
+        """Sending negative satoshis raises ValueError."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="neg_send")
+        with pytest.raises(ValueError, match="Amount must be positive"):
+            lw_send(wallet_name="neg_send", address=self.DEST_ADDRESS, amount=-100)
+
+    def test_send_without_password_when_encrypted_raises(self):
+        """Encrypted wallet requires password for send."""  # Significance: 4
+        lw_import_mnemonic(
+            mnemonic=TEST_MNEMONIC,
+            wallet_name="enc_send",
+            password="pass123",
+        )
+        manager = get_manager()
+        # Clear cached signer to simulate fresh load
+        manager._signers.pop("enc_send", None)
+
+        with pytest.raises(ValueError, match="[Pp]assword required"):
+            lw_send(wallet_name="enc_send", address=self.DEST_ADDRESS, amount=100)
+
+
+# ---------------------------------------------------------------------------
+# lw_send_asset  # Significance: 5 (Essential)
+# ---------------------------------------------------------------------------
+
+
+class TestSendAsset:
+    DEST_ADDRESS = "lq1qqvxk052kf3qtkxmrakx50a9gc3smqad2ync54hzntjt980kfej9kkfe0247rp5h4yzmdftsahhw64uy8pzfe7cpg4fgykm7cv"
+    FAKE_ASSET_ID = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+
+    def _setup_send_mocks(self, isolated_manager, wallet_name):
+        """Helper: set up mocks for send asset tests."""
+        mock_builder = MagicMock()
+        mock_pset = MagicMock()
+        mock_signed = MagicMock()
+        mock_tx = MagicMock()
+        mock_client = MagicMock()
+        mock_net = MagicMock()
+
+        mock_net.tx_builder.return_value = mock_builder
+        mock_builder.finish.return_value = mock_pset
+        isolated_manager._signers[wallet_name].sign = MagicMock(return_value=mock_signed)
+        mock_signed.finalize.return_value = mock_tx
+        isolated_manager._wollets[wallet_name] = MagicMock()
+
+        return mock_builder, mock_client, mock_net
+
+    def test_send_asset_success(self, isolated_manager):
+        """Send asset returns txid on success."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="asset_send")
+        mock_builder, mock_client, mock_net = self._setup_send_mocks(isolated_manager, "asset_send")
+        mock_client.broadcast.return_value = "asset_txid_123"
+
+        with (
+            patch.object(isolated_manager, "sync_wallet"),
+            patch.object(isolated_manager, "_get_network", return_value=mock_net),
+            patch.object(isolated_manager, "_get_client", return_value=mock_client),
+        ):
+            result = lw_send_asset(
+                wallet_name="asset_send",
+                address=self.DEST_ADDRESS,
+                amount=50000,
+                asset_id=self.FAKE_ASSET_ID,
+            )
+
+        assert result["txid"] == "asset_txid_123"
+        assert result["amount"] == 50000
+        assert result["asset_id"] == self.FAKE_ASSET_ID
+        assert result["address"] == self.DEST_ADDRESS
+
+    def test_send_asset_calls_add_recipient(self, isolated_manager):
+        """Send asset uses add_recipient (not add_lbtc_recipient)."""  # Significance: 5
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="asset_recv")
+        mock_builder, mock_client, mock_net = self._setup_send_mocks(isolated_manager, "asset_recv")
+        mock_client.broadcast.return_value = "ok"
+
+        with (
+            patch.object(isolated_manager, "sync_wallet"),
+            patch.object(isolated_manager, "_get_network", return_value=mock_net),
+            patch.object(isolated_manager, "_get_client", return_value=mock_client),
+        ):
+            lw_send_asset(
+                wallet_name="asset_recv",
+                address=self.DEST_ADDRESS,
+                amount=100,
+                asset_id=self.FAKE_ASSET_ID,
+            )
+
+        mock_builder.add_recipient.assert_called_once()
+        mock_builder.add_lbtc_recipient.assert_not_called()
+
+        call_args = mock_builder.add_recipient.call_args[0]
+        assert isinstance(call_args[0], lwk.Address)
+        assert call_args[1] == 100
+        assert call_args[2] == self.FAKE_ASSET_ID
+
+    def test_send_asset_zero_amount_raises(self):
+        """Sending zero satoshis of an asset raises ValueError."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="zero_asset")
+        with pytest.raises(ValueError, match="Amount must be positive"):
+            lw_send_asset(
+                wallet_name="zero_asset",
+                address=self.DEST_ADDRESS,
+                amount=0,
+                asset_id=self.FAKE_ASSET_ID,
+            )
+
+    def test_send_asset_negative_amount_raises(self):
+        """Sending negative satoshis of an asset raises ValueError."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="neg_asset")
+        with pytest.raises(ValueError, match="Amount must be positive"):
+            lw_send_asset(
+                wallet_name="neg_asset",
+                address=self.DEST_ADDRESS,
+                amount=-50,
+                asset_id=self.FAKE_ASSET_ID,
+            )
+
+    def test_send_asset_from_watch_only_raises(self):
+        """Cannot send asset from watch-only wallet."""  # Significance: 4
+        net = lwk.Network.mainnet()
+        m = lwk.Mnemonic(TEST_MNEMONIC)
+        signer = lwk.Signer(m, net)
+        desc = str(signer.wpkh_slip77_descriptor())
+
+        lw_import_descriptor(descriptor=desc, wallet_name="wo_asset")
+
+        with pytest.raises(ValueError, match="watch-only"):
+            lw_send_asset(
+                wallet_name="wo_asset",
+                address=self.DEST_ADDRESS,
+                amount=100,
+                asset_id=self.FAKE_ASSET_ID,
+            )
+
+
+# ---------------------------------------------------------------------------
+# lw_sweep  # Significance: 5 (Essential — prevents dust generation)
+# ---------------------------------------------------------------------------
+
+
+class TestSweep:
+    DEST_ADDRESS = "lq1qqvxk052kf3qtkxmrakx50a9gc3smqad2ync54hzntjt980kfej9kkfe0247rp5h4yzmdftsahhw64uy8pzfe7cpg4fgykm7cv"
+    FAKE_ASSET_ID = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+    # L-BTC policy asset on mainnet (matches WalletManager._get_policy_asset("mainnet"))
+    LBTC_POLICY_ASSET = "6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d"
+
+    def _setup_sweep_mocks(self, isolated_manager, wallet_name, balance_map):
+        """Helper: set up mocks for sweep tests.
+
+        ``balance_map`` is the dict returned by the fake wollet.balance() —
+        keys are asset ids (hex), values are sat amounts.
+        """
+        mock_builder = MagicMock()
+        mock_pset = MagicMock()
+        mock_signed = MagicMock()
+        mock_tx = MagicMock()
+        mock_client = MagicMock()
+        mock_net = MagicMock()
+        mock_wollet = MagicMock()
+
+        mock_wollet.balance.return_value = balance_map
+        mock_net.tx_builder.return_value = mock_builder
+        # sweep() calls _get_policy_asset → str(net.policy_asset()); make
+        # str() yield the real L-BTC policy hex so the balance lookup hits.
+        mock_net.policy_asset.return_value = self.LBTC_POLICY_ASSET
+        mock_builder.finish.return_value = mock_pset
+        isolated_manager._signers[wallet_name].sign = MagicMock(return_value=mock_signed)
+        mock_signed.finalize.return_value = mock_tx
+        isolated_manager._wollets[wallet_name] = mock_wollet
+
+        return mock_builder, mock_client, mock_net, mock_wollet
+
+    def test_sweep_lbtc_calls_drain_lbtc_wallet_and_drain_lbtc_to(self, isolated_manager):
+        """L-BTC sweep uses LWK's native drain_lbtc_* APIs (not add_lbtc_recipient)."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="sweep_lbtc")
+        mock_builder, mock_client, mock_net, _ = self._setup_sweep_mocks(
+            isolated_manager, "sweep_lbtc", {self.LBTC_POLICY_ASSET: 50_000}
+        )
+        mock_client.broadcast.return_value = "sweep_lbtc_txid"
+
+        with (
+            patch.object(isolated_manager, "sync_wallet"),
+            patch.object(isolated_manager, "_get_network", return_value=mock_net),
+            patch.object(isolated_manager, "_get_client", return_value=mock_client),
+        ):
+            result = lw_sweep(wallet_name="sweep_lbtc", address=self.DEST_ADDRESS)
+
+        mock_builder.drain_lbtc_wallet.assert_called_once_with()
+        mock_builder.drain_lbtc_to.assert_called_once()
+        address_arg = mock_builder.drain_lbtc_to.call_args[0][0]
+        assert isinstance(address_arg, lwk.Address)
+        mock_builder.add_lbtc_recipient.assert_not_called()
+        mock_builder.add_recipient.assert_not_called()
+        assert result["txid"] == "sweep_lbtc_txid"
+        assert result["ticker"] == "L-BTC"
+        assert "asset_id" not in result
+
+    def test_sweep_asset_calls_add_recipient_with_full_balance(self, isolated_manager):
+        """Asset sweep sends the entire asset balance via add_recipient; the
+        L-BTC drain_lbtc_* primitives must NOT be called (L-BTC change is
+        intentionally left in the wallet for asset sweeps)."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="sweep_asset")
+        mock_builder, mock_client, mock_net, _ = self._setup_sweep_mocks(
+            isolated_manager,
+            "sweep_asset",
+            {self.LBTC_POLICY_ASSET: 5_000, self.FAKE_ASSET_ID: 12_345},
+        )
+        mock_client.broadcast.return_value = "sweep_asset_txid"
+
+        with (
+            patch.object(isolated_manager, "sync_wallet"),
+            patch.object(isolated_manager, "_get_network", return_value=mock_net),
+            patch.object(isolated_manager, "_get_client", return_value=mock_client),
+        ):
+            result = lw_sweep(
+                wallet_name="sweep_asset",
+                address=self.DEST_ADDRESS,
+                asset_id=self.FAKE_ASSET_ID,
+            )
+
+        mock_builder.add_recipient.assert_called_once()
+        call_args = mock_builder.add_recipient.call_args[0]
+        assert isinstance(call_args[0], lwk.Address)
+        assert call_args[1] == 12_345
+        assert call_args[2] == self.FAKE_ASSET_ID
+        mock_builder.drain_lbtc_wallet.assert_not_called()
+        mock_builder.drain_lbtc_to.assert_not_called()
+        assert result["asset_id"] == self.FAKE_ASSET_ID
+        assert result["txid"] == "sweep_asset_txid"
+
+    def test_sweep_normalizes_policy_asset_id_to_lbtc_path(self, isolated_manager):
+        """An explicit policy asset id is collapsed to the L-BTC sweep path."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="sweep_norm")
+        mock_builder, mock_client, mock_net, _ = self._setup_sweep_mocks(
+            isolated_manager, "sweep_norm", {self.LBTC_POLICY_ASSET: 1_000}
+        )
+        mock_client.broadcast.return_value = "ok"
+
+        with (
+            patch.object(isolated_manager, "sync_wallet"),
+            patch.object(isolated_manager, "_get_network", return_value=mock_net),
+            patch.object(isolated_manager, "_get_client", return_value=mock_client),
+        ):
+            lw_sweep(
+                wallet_name="sweep_norm",
+                address=self.DEST_ADDRESS,
+                asset_id=self.LBTC_POLICY_ASSET,
+            )
+
+        mock_builder.drain_lbtc_wallet.assert_called_once_with()
+        mock_builder.drain_lbtc_to.assert_called_once()
+        mock_builder.add_recipient.assert_not_called()
+
+    def test_sweep_zero_lbtc_balance_raises(self, isolated_manager):
+        """Empty L-BTC balance → cannot sweep."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="sweep_empty")
+        self._setup_sweep_mocks(isolated_manager, "sweep_empty", {self.LBTC_POLICY_ASSET: 0})
+
+        with patch.object(isolated_manager, "sync_wallet"):
+            with pytest.raises(ValueError, match="No L-BTC to sweep"):
+                lw_sweep(wallet_name="sweep_empty", address=self.DEST_ADDRESS)
+
+    def test_sweep_zero_asset_balance_raises(self, isolated_manager):
+        """Asset not present in wallet → cannot sweep that asset."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="sweep_no_asset")
+        self._setup_sweep_mocks(
+            isolated_manager, "sweep_no_asset", {self.LBTC_POLICY_ASSET: 10_000}
+        )
+
+        with patch.object(isolated_manager, "sync_wallet"):
+            with pytest.raises(ValueError, match="balance to sweep"):
+                lw_sweep(
+                    wallet_name="sweep_no_asset",
+                    address=self.DEST_ADDRESS,
+                    asset_id=self.FAKE_ASSET_ID,
+                )
+
+    def test_sweep_watch_only_raises(self, isolated_manager):
+        """Cannot sweep a watch-only wallet."""
+        net = lwk.Network.mainnet()
+        m = lwk.Mnemonic(TEST_MNEMONIC)
+        signer = lwk.Signer(m, net)
+        desc = str(signer.wpkh_slip77_descriptor())
+        lw_import_descriptor(descriptor=desc, wallet_name="wo_sweep")
+
+        with pytest.raises(ValueError, match="watch-only"):
+            lw_sweep(wallet_name="wo_sweep", address=self.DEST_ADDRESS)
+
+    def test_sweep_nonexistent_wallet_raises(self):
+        """Sweeping a non-existent wallet raises."""
+        with pytest.raises(ValueError, match="not found"):
+            lw_sweep(wallet_name="ghost", address=self.DEST_ADDRESS)
+
+    def test_sweep_encrypted_without_password_raises(self):
+        """Encrypted wallet without password → fail before reaching LWK."""
+        lw_import_mnemonic(
+            mnemonic=TEST_MNEMONIC,
+            wallet_name="sweep_enc",
+            password="pass123",
+        )
+        manager = get_manager()
+        manager._signers.pop("sweep_enc", None)
+
+        with pytest.raises(ValueError, match="[Pp]assword required"):
+            lw_sweep(wallet_name="sweep_enc", address=self.DEST_ADDRESS)
+
+
+# ---------------------------------------------------------------------------
+# craft_raw_tx (build-without-broadcast)  # Significance: 5 (Essential)
+# ---------------------------------------------------------------------------
+
+
+class TestCraftRawTx:
+    """`craft_raw_tx` returns a hex tx and never broadcasts."""
+
+    DEST_BLINDED = (
+        "lq1qqvxk052kf3qtkxmrakx50a9gc3smqad2ync54hzntjt980kfej9kkfe"
+        "0247rp5h4yzmdftsahhw64uy8pzfe7cpg4fgykm7cv"
+    )
+
+    def _setup(self, manager, wallet_name):
+        builder = MagicMock()
+        pset = MagicMock()
+        detailed_pset = MagicMock()
+        signed = MagicMock()
+        finalized = MagicMock()
+        finalized.__str__ = lambda self: "0200000001deadbeef00"
+        wollet = MagicMock()
+        net = MagicMock()
+
+        net.tx_builder.return_value = builder
+        builder.finish.return_value = pset
+        wollet.add_details.return_value = detailed_pset
+        manager._signers[wallet_name].sign = MagicMock(return_value=signed)
+        signed.finalize.return_value = finalized
+        manager._wollets[wallet_name] = wollet
+        return builder, wollet, net, finalized
+
+    def test_lbtc_blinded_uses_add_lbtc_recipient(self, isolated_manager):
+        """Confidential dest + L-BTC → add_lbtc_recipient, NOT add_recipient."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="craft_lbtc")
+        builder, wollet, net, _ = self._setup(isolated_manager, "craft_lbtc")
+
+        with (
+            patch.object(isolated_manager, "sync_wallet"),
+            patch.object(isolated_manager, "_get_network", return_value=net),
+        ):
+            raw = isolated_manager.craft_raw_tx(
+                wallet_name="craft_lbtc",
+                address=self.DEST_BLINDED,
+                amount=100,
+            )
+
+        assert raw == "0200000001deadbeef00"
+        builder.add_lbtc_recipient.assert_called_once()
+        builder.add_recipient.assert_not_called()
+        builder.add_explicit_recipient.assert_not_called()
+        # The PSET is passed through wollet.add_details before signing.
+        wollet.add_details.assert_called_once()
+
+    def test_blinded_non_lbtc_uses_add_recipient(self, isolated_manager):
+        """Confidential dest + non-policy asset → add_recipient(amount, asset)."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="craft_asset")
+        builder, wollet, net, _ = self._setup(isolated_manager, "craft_asset")
+        other_asset = "abcdef" * 10 + "abcd"  # arbitrary 64-hex-char id
+
+        with (
+            patch.object(isolated_manager, "sync_wallet"),
+            patch.object(isolated_manager, "_get_network", return_value=net),
+        ):
+            isolated_manager.craft_raw_tx(
+                wallet_name="craft_asset",
+                address=self.DEST_BLINDED,
+                amount=42,
+                asset_id=other_asset,
+            )
+
+        builder.add_recipient.assert_called_once()
+        args = builder.add_recipient.call_args[0]
+        assert args[1] == 42
+        assert args[2] == other_asset
+        builder.add_lbtc_recipient.assert_not_called()
+        builder.add_explicit_recipient.assert_not_called()
+
+    def test_unblinded_uses_add_explicit_recipient(self, isolated_manager):
+        """Unblinded (explicit) dest → add_explicit_recipient with asset id resolved."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="craft_expl")
+        builder, wollet, net, _ = self._setup(isolated_manager, "craft_expl")
+
+        fake_addr = MagicMock()
+        fake_addr.is_blinded.return_value = False
+        canned_policy = "6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d"
+
+        with (
+            patch.object(isolated_manager, "sync_wallet"),
+            patch.object(isolated_manager, "_get_network", return_value=net),
+            patch.object(isolated_manager, "_get_policy_asset", return_value=canned_policy),
+            patch("aqua.wallet.lwk.Address", return_value=fake_addr),
+        ):
+            isolated_manager.craft_raw_tx(
+                wallet_name="craft_expl",
+                address="anything-unblinded",
+                amount=7,
+            )
+
+        builder.add_explicit_recipient.assert_called_once()
+        args = builder.add_explicit_recipient.call_args[0]
+        assert args[0] is fake_addr
+        assert args[1] == 7
+        # The L-BTC policy asset id was resolved automatically for unblinded.
+        assert args[2] == canned_policy
+        builder.add_lbtc_recipient.assert_not_called()
+        builder.add_recipient.assert_not_called()
+
+    def test_does_not_broadcast(self, isolated_manager):
+        """`craft_raw_tx` must not call client.broadcast."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="craft_nobroadcast")
+        _, _, net, _ = self._setup(isolated_manager, "craft_nobroadcast")
+        mock_client = MagicMock()
+
+        with (
+            patch.object(isolated_manager, "sync_wallet"),
+            patch.object(isolated_manager, "_get_network", return_value=net),
+            patch.object(isolated_manager, "_get_client", return_value=mock_client),
+        ):
+            isolated_manager.craft_raw_tx(
+                wallet_name="craft_nobroadcast",
+                address=self.DEST_BLINDED,
+                amount=100,
+            )
+
+        mock_client.broadcast.assert_not_called()
+
+    def test_watch_only_rejects(self, isolated_manager):
+        net = lwk.Network.mainnet()
+        signer = lwk.Signer(lwk.Mnemonic(TEST_MNEMONIC), net)
+        desc = str(signer.wpkh_slip77_descriptor())
+        lw_import_descriptor(descriptor=desc, wallet_name="wo_craft")
+
+        with pytest.raises(ValueError, match="watch-only"):
+            isolated_manager.craft_raw_tx(
+                wallet_name="wo_craft",
+                address=self.DEST_BLINDED,
+                amount=100,
+            )
+
+    def test_zero_amount_rejects(self, isolated_manager):
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="craft_zero")
+        with pytest.raises(ValueError, match="Amount must be positive"):
+            isolated_manager.craft_raw_tx(
+                wallet_name="craft_zero",
+                address=self.DEST_BLINDED,
+                amount=0,
+            )
+
+    def test_negative_amount_rejects(self, isolated_manager):
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="craft_neg")
+        with pytest.raises(ValueError, match="Amount must be positive"):
+            isolated_manager.craft_raw_tx(
+                wallet_name="craft_neg",
+                address=self.DEST_BLINDED,
+                amount=-1,
+            )
+
+    def test_missing_wallet_raises(self, isolated_manager):
+        with pytest.raises(ValueError, match="not found"):
+            isolated_manager.craft_raw_tx(
+                wallet_name="ghost_craft",
+                address=self.DEST_BLINDED,
+                amount=1,
+            )
+
+
+# ---------------------------------------------------------------------------
+# WalletManager internal logic  # Significance: 4 (Important)
+# ---------------------------------------------------------------------------
+
+
+class TestWalletManagerInternals:
+    def test_get_network_mainnet(self, isolated_manager):
+        """_get_network returns mainnet correctly."""
+        net = isolated_manager._get_network("mainnet")
+        assert net.is_mainnet()
+
+    def test_get_network_testnet(self, isolated_manager):
+        """_get_network returns testnet correctly."""
+        net = isolated_manager._get_network("testnet")
+        assert not net.is_mainnet()
+
+    def test_get_network_invalid_raises(self, isolated_manager):
+        """Invalid network name raises ValueError."""  # Significance: 3
+        with pytest.raises(ValueError, match="Unknown network"):
+            isolated_manager._get_network("regtest")
+
+    def test_import_caches_signer(self, isolated_manager):
+        """After import, the signer is cached in memory."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="cache_test")
+        assert "cache_test" in isolated_manager._signers
+
+    def test_load_wallet_with_password_restores_signer(self, isolated_manager):
+        """Loading an encrypted wallet with the correct password restores the signer."""
+        lw_import_mnemonic(
+            mnemonic=TEST_MNEMONIC,
+            wallet_name="restore_test",
+            password="mypass",
+        )
+        # Clear cache to simulate restart
+        isolated_manager._signers.pop("restore_test", None)
+        assert "restore_test" not in isolated_manager._signers
+
+        isolated_manager.load_wallet("restore_test", password="mypass")
+        assert "restore_test" in isolated_manager._signers
+
+    def test_send_no_password_uses_default_encryption(self, isolated_manager):
+        """Wallet imported without password uses default encryption and can sign."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="no_sign")
+        isolated_manager._signers.pop("no_sign", None)
+        wallet = isolated_manager.storage.load_wallet("no_sign")
+        assert wallet.encrypted_mnemonic is not None
+        assert wallet.encrypted_mnemonic.startswith("default:1:")
+        assert not isolated_manager.storage.requires_user_password(wallet.encrypted_mnemonic)
+
+        isolated_manager.load_wallet("no_sign")
+        assert "no_sign" in isolated_manager._signers
+
+
+# ---------------------------------------------------------------------------
+# MCP server tool registry  # Significance: 3 (Good-to-have)
+# ---------------------------------------------------------------------------
+
+
+class TestToolRegistry:
+    def test_all_tools_registered(self):
+        """All MCP tools are in the TOOLS registry."""
+        from aqua.tools import TOOLS
+
+        expected = {
+            "lw_create_wallet",
+            "lw_backup_mnemonic",
+            "lw_import_mnemonic",
+            "lw_import_descriptor",
+            "lw_export_descriptor",
+            "lw_balance",
+            "lw_address",
+            "lw_transactions",
+            "lw_send",
+            "lw_send_asset",
+            "lw_sweep",
+            "lw_list_wallets",
+            "lw_list_assets",
+            "lw_tx_status",
+            "btc_balance",
+            "btc_address",
+            "btc_transactions",
+            "btc_send",
+            "btc_sweep",
+            "unified_balance",
+            "lightning_receive",
+            "lightning_send",
+            "lightning_transaction_status",
+            "lightning_refund",
+            "lightning_decode",
+            "eulen_kyc_session",
+            "eulen_kyc_confirm",
+            "pix_receive",
+            "pix_list",
+            "pix_status",
+            "qr_generate",
+            "qr_decode",
+            "delete_wallet",
+            "btc_import_descriptor",
+            "btc_export_descriptor",
+            "changelly_list_currencies",
+            "changelly_quote",
+            "changelly_send",
+            "changelly_receive",
+            "changelly_status",
+            "sideshift_list_coins",
+            "sideshift_pair_info",
+            "sideshift_quote",
+            "sideshift_send",
+            "sideshift_receive",
+            "sideshift_status",
+            "sideshift_recommend",
+            "sideswap_server_status",
+            "sideswap_peg_quote",
+            "sideswap_peg_in",
+            "sideswap_peg_out",
+            "sideswap_peg_status",
+            "sideswap_recommend",
+            "sideswap_list_assets",
+            "sideswap_quote",
+            "sideswap_execute_swap",
+            "sideswap_swap_status",
+            "jan3_login",
+            "jan3_verify",
+            "wapupay_exchange_rates",
+            "wapupay_quote",
+            "wapupay_create_order",
+            "wapupay_fund_order",
+            "wapupay_order_status",
+            "wapupay_orders",
+            "wapupay_transactions",
+            "wapupay_transaction",
+            "wapupay_spending_limit",
+            "wapupay_provision_account",
+            "jan3_login_start",
+            "jan3_login_complete",
+            "jan3_session_info",
+            "jan3_list_sessions",
+            "jan3_logout",
+            "jan3_user_info",
+            "jan3_enable_lightning_address",
+            "jan3_rebind_wallet",
+            "jan3_ln_check_username",
+            "jan3_purchase_ln_username",
+            "doctor",
+        }
+        assert set(TOOLS.keys()) == expected
+
+    def test_all_tools_are_callable(self):
+        """Every registered tool is a callable."""
+        from aqua.tools import TOOLS
+
+        for name, fn in TOOLS.items():
+            assert callable(fn), f"Tool {name} is not callable"
+
+
+# ---------------------------------------------------------------------------
+# delete_wallet
+# ---------------------------------------------------------------------------
+
+
+def _confirmed_delete(wallet_name):
+    """Preview, then confirm with the returned token (the MCP flow)."""
+    with patch("aqua.tools.unified_balance", return_value={"liquid": {"balances": []}}):
+        token = delete_wallet(wallet_name=wallet_name)["confirm_token"]
+    return delete_wallet(wallet_name=wallet_name, confirm=True, confirm_token=token)
+
+
+class TestDeleteWallet:
+    """Tests for the delete_wallet tool."""
+
+    def test_delete_nonexistent_raises(self):
+        """ValueError when wallet doesn't exist."""
+        with pytest.raises(ValueError, match="not found"):
+            delete_wallet(wallet_name="nonexistent")
+
+    def test_delete_removes_sideswap_pegs_for_wallet(self, isolated_manager):
+        """SideSwap peg records belonging to the wallet are removed too."""
+        from aqua.sideswap import SideSwapPeg
+        from datetime import UTC, datetime
+
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="pegowner", network="testnet")
+        # Save a peg owned by this wallet plus one owned by another wallet.
+        own_peg = SideSwapPeg(
+            order_id="aaa111",
+            peg_in=True,
+            peg_addr="bc1q...",
+            recv_addr="lq1...",
+            amount=None,
+            expected_recv=None,
+            wallet_name="pegowner",
+            network="testnet",
+            status="completed",
+            created_at=datetime.now(UTC).isoformat(),
+        )
+        other_peg = SideSwapPeg(
+            order_id="bbb222",
+            peg_in=True,
+            peg_addr="bc1q...",
+            recv_addr="lq1...",
+            amount=None,
+            expected_recv=None,
+            wallet_name="someone_else",
+            network="testnet",
+            status="pending",
+            created_at=datetime.now(UTC).isoformat(),
+        )
+        isolated_manager.storage.save_sideswap_peg(own_peg)
+        isolated_manager.storage.save_sideswap_peg(other_peg)
+
+        result = _confirmed_delete("pegowner")
+        assert result["sideswap_pegs_removed"] == 1
+        assert isolated_manager.storage.load_sideswap_peg("aaa111") is None
+        # Other wallet's peg untouched.
+        assert isolated_manager.storage.load_sideswap_peg("bbb222") is not None
+
+    def test_delete_removes_wallet(self, isolated_manager):
+        """Wallet file is gone from storage after deletion."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="todelete", network="testnet")
+        assert "todelete" in lw_list_wallets()["wallets"]
+
+        result = _confirmed_delete("todelete")
+        assert result["deleted"] is True
+        assert result["wallet_name"] == "todelete"
+        assert result["sideswap_pegs_removed"] == 0
+        assert "todelete" not in lw_list_wallets()["wallets"]
+
+    def test_delete_clears_lw_manager_caches(self, isolated_manager):
+        """Liquid manager caches (_signers/_wollets) are cleared."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="cached", network="testnet")
+        manager = get_manager()
+        # Force cache population by getting a wollet
+        manager._signers["cached"] = "fake_signer"
+        manager._wollets["cached"] = "fake_wollet"
+
+        _confirmed_delete("cached")
+        assert "cached" not in manager._signers
+        assert "cached" not in manager._wollets
+
+    def test_delete_clears_btc_manager_caches(self, isolated_manager):
+        """Bitcoin manager caches (_wallets/_persisters/_networks) are cleared."""
+        from aqua.tools import get_btc_manager
+
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="btccached", network="testnet")
+        btc = get_btc_manager()
+        # Populate caches with fakes
+        btc._wallets["btccached"] = "fake_wallet"
+        btc._persisters["btccached"] = "fake_persister"
+        btc._networks["btccached"] = "testnet"
+
+        _confirmed_delete("btccached")
+        assert "btccached" not in btc._wallets
+        assert "btccached" not in btc._persisters
+        assert "btccached" not in btc._networks
+
+    def test_delete_returns_success(self, isolated_manager):
+        """Returns the expected success dict."""
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="success", network="testnet")
+        result = _confirmed_delete("success")
+        assert result["deleted"] is True
+        assert result["wallet_name"] == "success"
+
+    def test_without_confirm_deletes_nothing_and_previews(self, isolated_manager):
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="prev", network="testnet")
+        storage = isolated_manager.storage
+        storage.backup_path("prev").parent.mkdir(exist_ok=True)
+        storage.backup_path("prev").write_text("seed words\n")
+        fake = {"wallet_name": "prev", "bitcoin": None, "liquid": {"balances": []}}
+        with patch("aqua.tools.unified_balance", return_value=fake):
+            result = delete_wallet(wallet_name="prev")
+        assert result["deleted"] is False
+        assert result["confirm_required"] is True
+        assert result["balance"] == fake
+        assert result["has_seed"] is True
+        assert result["backup_file_exists"] is True
+        assert "confirm=true" in result["warning"]
+        assert result["confirm_token"] and result["confirm_token_expires_in_seconds"] == 300
+        assert storage.wallet_exists("prev")
+        assert storage.backup_path("prev").exists()
+
+    def _preview_token(self, name):
+        with patch("aqua.tools.unified_balance", return_value={}):
+            return delete_wallet(wallet_name=name)["confirm_token"]
+
+    def test_confirm_without_preview_is_refused(self, isolated_manager):
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="blind", network="testnet")
+        with pytest.raises(ValueError, match="fresh preview"):
+            delete_wallet(wallet_name="blind", confirm=True)
+        with pytest.raises(ValueError, match="fresh preview"):
+            delete_wallet(wallet_name="blind", confirm=True, confirm_token="guess")
+        assert isolated_manager.storage.wallet_exists("blind")
+
+    def test_wrong_token_is_refused_and_consumes_the_real_one(self, isolated_manager):
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="wrong", network="testnet")
+        token = self._preview_token("wrong")
+        with pytest.raises(ValueError, match="fresh preview"):
+            delete_wallet(wallet_name="wrong", confirm=True, confirm_token="nope")
+        assert isolated_manager.storage.wallet_exists("wrong")
+        with pytest.raises(ValueError, match="fresh preview"):
+            delete_wallet(wallet_name="wrong", confirm=True, confirm_token=token)
+        assert isolated_manager.storage.wallet_exists("wrong")
+
+    def test_expired_token_is_refused(self, isolated_manager):
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="late", network="testnet")
+        token = self._preview_token("late")
+        with patch("aqua.tools.time.monotonic", return_value=time.monotonic() + 301):
+            with pytest.raises(ValueError, match="fresh preview"):
+                delete_wallet(wallet_name="late", confirm=True, confirm_token=token)
+        assert isolated_manager.storage.wallet_exists("late")
+
+    def test_token_is_single_use(self, isolated_manager):
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="once", network="testnet")
+        token = self._preview_token("once")
+        assert delete_wallet(wallet_name="once", confirm=True, confirm_token=token)["deleted"]
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="once", network="testnet")
+        with pytest.raises(ValueError, match="fresh preview"):
+            delete_wallet(wallet_name="once", confirm=True, confirm_token=token)
+        assert isolated_manager.storage.wallet_exists("once")
+
+    def test_token_for_one_wallet_does_not_delete_another(self, isolated_manager):
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="wa", network="testnet")
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="wb", network="testnet")
+        token_a = self._preview_token("wa")
+        with pytest.raises(ValueError, match="fresh preview"):
+            delete_wallet(wallet_name="wb", confirm=True, confirm_token=token_a)
+        assert isolated_manager.storage.wallet_exists("wa")
+        assert isolated_manager.storage.wallet_exists("wb")
+
+    def test_preview_balance_failure_is_reported_not_hidden(self, isolated_manager):
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="nobal", network="testnet")
+        with patch("aqua.tools.unified_balance", side_effect=RuntimeError("offline")):
+            result = delete_wallet(wallet_name="nobal")
+        assert result["deleted"] is False
+        assert "offline" in result["balance_error"]
+        assert isolated_manager.storage.wallet_exists("nobal")
+
+    def test_confirm_removes_wallet_cache_backup_but_not_lightning_swaps(self, isolated_manager):
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="gone", network="testnet")
+        storage = isolated_manager.storage
+        cache = storage.get_cache_path("gone")
+        (cache / "x.db").touch()
+        storage.backup_path("gone").parent.mkdir(exist_ok=True)
+        storage.backup_path("gone").write_text("seed words\n")
+        storage.lightning_swaps_dir.mkdir(exist_ok=True)
+        swap = storage.lightning_swaps_dir / "swap1.json"
+        swap.write_text("{}")
+
+        result = _confirmed_delete("gone")
+        assert result["deleted"] is True
+        assert result["backup_file_removed"] is True
+        assert not storage.wallet_exists("gone")
+        assert not cache.exists()
+        assert not storage.backup_path("gone").exists()
+        assert not (storage.wallets_dir / "gone.lock").exists()
+        assert swap.exists()
+
+    def test_pending_swaps_are_previewed_and_block_confirmed_delete(self, isolated_manager):
+        from datetime import UTC, datetime
+
+        from aqua.lightning import LightningSwap
+        from aqua.sideswap import SideSwapPeg
+
+        lw_import_mnemonic(mnemonic=TEST_MNEMONIC, wallet_name="busy", network="testnet")
+        storage = isolated_manager.storage
+        now = datetime.now(UTC).isoformat()
+
+        def peg(order_id, status, wallet="busy"):
+            storage.save_sideswap_peg(
+                SideSwapPeg(
+                    order_id=order_id,
+                    peg_in=True,
+                    peg_addr="bc1q...",
+                    recv_addr="lq1...",
+                    amount=None,
+                    expected_recv=None,
+                    wallet_name=wallet,
+                    network="testnet",
+                    status=status,
+                    created_at=now,
+                )
+            )
+
+        def ln(swap_id, status, swap_type="send", refund_txid=None):
+            storage.save_lightning_swap(
+                LightningSwap(
+                    swap_id=swap_id,
+                    swap_type=swap_type,
+                    provider="boltz",
+                    invoice="lnbc1",
+                    amount=1000,
+                    wallet_name="busy",
+                    status=status,
+                    network="testnet",
+                    created_at=now,
+                    refund_txid=refund_txid,
+                )
+            )
+
+        peg("peg_open", "detected")
+        peg("peg_done", "completed")
+        peg("peg_other", "pending", wallet="someone_else")
+        ln("ln_inflight", "processing")
+        ln("ln_failed", "failed")
+        ln("ln_refunded", "failed", refund_txid="ab" * 32)
+        ln("ln_done", "completed")
+        ln("ln_receive", "pending", swap_type="receive")
+
+        with patch("aqua.tools.unified_balance", return_value={"liquid": {"balances": []}}):
+            preview = delete_wallet(wallet_name="busy")
+        assert {p["id"] for p in preview["pending_swaps"]} == {
+            "peg_open",
+            "ln_inflight",
+            "ln_failed",
+        }
+        assert "pending swaps" in preview["warning"]
+
+        with pytest.raises(ValueError, match="pending swaps.*peg_open.*Nothing was deleted"):
+            delete_wallet(wallet_name="busy", confirm=True, confirm_token=preview["confirm_token"])
+        assert storage.wallet_exists("busy")
+        assert storage.load_sideswap_peg("peg_open") is not None
+
+
+# ---------------------------------------------------------------------------
+# Helper: bootstrap a real BIP84 descriptor pair via the unified import flow
+# ---------------------------------------------------------------------------
+
+
+def _seed_tool_btc_descriptors(network: str = "mainnet"):
+    """Bootstrap canonical BIP84 ext + change descriptors for tool-layer tests.
+
+    lw_import_mnemonic already calls btc_manager.create_wallet internally,
+    so we only need to call lw_import_mnemonic and then read back the stored
+    descriptors from storage.
+    """
+    lw_import_mnemonic(TEST_MNEMONIC, "seed_btc", network)
+    manager = get_btc_manager()
+    w = manager.storage.load_wallet("seed_btc")
+    return w.btc_descriptor, w.btc_change_descriptor
+
+
+# ---------------------------------------------------------------------------
+# btc_import_descriptor  # Significance: 5 (Essential)
+# ---------------------------------------------------------------------------
+
+
+class TestBtcImportDescriptor:
+    def test_returns_expected_keys(self):
+        """btc_import_descriptor returns all required keys."""
+        ext, chg = _seed_tool_btc_descriptors()
+        result = btc_import_descriptor(
+            descriptor=ext, wallet_name="import_test", change_descriptor=chg
+        )
+
+        assert "wallet_name" in result
+        assert "network" in result
+        assert "btc_descriptor" in result
+        assert "btc_change_descriptor" in result
+        assert "watch_only" in result
+        assert "message" in result
+        assert result["watch_only"] is True
+
+    def test_message_mentions_lw_import_descriptor(self):
+        """The message field advises using lw_import_descriptor for Liquid."""
+        ext, chg = _seed_tool_btc_descriptors()
+        result = btc_import_descriptor(
+            descriptor=ext, wallet_name="msg_test", change_descriptor=chg
+        )
+
+        assert "lw_import_descriptor" in result["message"]
+
+    def test_propagates_value_error(self):
+        """Importing a descriptor into a wallet that already has Bitcoin raises ValueError."""
+        ext, chg = _seed_tool_btc_descriptors()
+        btc_import_descriptor(descriptor=ext, wallet_name="dup_btc", change_descriptor=chg)
+
+        with pytest.raises(ValueError, match="already has a Bitcoin descriptor"):
+            btc_import_descriptor(descriptor=ext, wallet_name="dup_btc", change_descriptor=chg)
+
+
+# ---------------------------------------------------------------------------
+# btc_export_descriptor  # Significance: 5 (Essential)
+# ---------------------------------------------------------------------------
+
+
+class TestBtcExportDescriptor:
+    def test_returns_expected_keys(self):
+        """btc_export_descriptor returns all required keys."""
+        lw_import_mnemonic(TEST_MNEMONIC, "exp_btc", "mainnet")
+
+        result = btc_export_descriptor(wallet_name="exp_btc")
+
+        assert "wallet_name" in result
+        assert "network" in result
+        assert "external_descriptor" in result
+        assert "change_descriptor" in result
+        assert "xpub" in result
+        assert "fingerprint" in result
+        assert "derivation_path" in result
+        assert "note" in result
+
+    def test_note_mentions_lw_export_descriptor(self):
+        """The note field references lw_export_descriptor for Liquid."""
+        lw_import_mnemonic(TEST_MNEMONIC, "note_btc", "mainnet")
+
+        result = btc_export_descriptor(wallet_name="note_btc")
+
+        assert "lw_export_descriptor" in result["note"]
+
+    def test_unknown_wallet_raises(self):
+        """Exporting descriptor for a non-existent wallet raises ValueError matching 'not found'."""
+        with pytest.raises(ValueError, match="not found"):
+            btc_export_descriptor(wallet_name="ghost_btc")
+
+
+# ---------------------------------------------------------------------------
+# changelly_send — amount_from validation
+# ---------------------------------------------------------------------------
+
+
+class TestChangellySendAmountValidation:
+    """amount_from must be a positive decimal before hitting Changelly."""
+
+    def test_empty_amount_from_raises(self):
+        with pytest.raises(ValueError, match="amount_from must be a non-empty"):
+            changelly_send("solana", "So11111111111111111111111111111111111111112", "")
+
+    def test_whitespace_only_raises(self):
+        with pytest.raises(ValueError, match="amount_from must be a non-empty"):
+            changelly_send("solana", "So11111111111111111111111111111111111111112", "   ")
+
+    def test_zero_raises(self):
+        with pytest.raises(ValueError, match="amount_from must be positive"):
+            changelly_send("solana", "So11111111111111111111111111111111111111112", "0")
+
+    def test_negative_raises(self):
+        with pytest.raises(ValueError, match="amount_from must be positive"):
+            changelly_send("solana", "So11111111111111111111111111111111111111112", "-10")
+
+    def test_invalid_decimal_raises(self):
+        with pytest.raises(ValueError, match="amount_from must be a valid decimal"):
+            changelly_send("solana", "So11111111111111111111111111111111111111112", "not-a-number")
+
+
+# ---------------------------------------------------------------------------
+# TOOLS registry — btc_import_descriptor / btc_export_descriptor
+# ---------------------------------------------------------------------------
+
+
+
+# ---------------------------------------------------------------------------
+# lw_tx_status — Esplora backend fallback  # Significance: 5 (Essential)
+# ---------------------------------------------------------------------------
+
+TX_ID = "a" * 64
+
+FIRST_BACKEND = "https://first.example/api"
+SECOND_BACKEND = "https://second.example/api"
+
+UNCONFIRMED_TX = json.dumps(
+    {
+        "txid": TX_ID,
+        "status": {"confirmed": False},
+        "fee": 42,
+        "vout": [{"scriptpubkey_address": "lq1qqvalid", "value": 1000}],
+    }
+)
+
+CONFIRMED_TX = json.dumps(
+    {
+        "txid": TX_ID,
+        "status": {"confirmed": True, "block_height": 100, "block_time": 1700000000},
+        "fee": 42,
+        "vout": [],
+    }
+)
+
+
+class _FakeEsploraResponse:
+    """Minimal stand-in for the object urlopen returns as a context manager."""
+
+    def __init__(self, body: str | bytes):
+        self._body = body if isinstance(body, bytes) else body.encode()
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _http_error(url: str, code: int) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(url, code, "fake error", {}, None)
+
+
+def _routed_urlopen(routes: dict):
+    """urlopen replacement answering by URL prefix; unrouted URLs are a test bug."""
+
+    def _open(req, timeout=None):
+        url = req.full_url
+        for prefix, outcome in routes.items():
+            if url.startswith(prefix):
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return _FakeEsploraResponse(outcome)
+        raise AssertionError(f"unexpected request to {url}")
+
+    return _open
+
+
+@pytest.fixture
+def two_backends(monkeypatch):
+    """Point the tx-status helper at two fake HTTP backends."""
+    import aqua.tools as tools_module
+
+    monkeypatch.setattr(
+        tools_module,
+        "LIQUID_BACKEND_URLS",
+        {"mainnet": [FIRST_BACKEND, SECOND_BACKEND]},
+    )
+
+
+class TestEsploraBases:
+    def test_mirrors_wallet_backend_list(self):
+        """The tx-status base list is derived from the wallet's, not a second copy."""
+        expected = [
+            url.rstrip("/")
+            for url in LIQUID_BACKEND_URLS["mainnet"]
+            if url.startswith(("http://", "https://"))
+        ]
+        assert _esplora_bases("mainnet") == expected
+        assert expected, "wallet mainnet backends should include at least one HTTP base"
+
+    def test_testnet_mirrors_wallet_backend_list(self):
+        expected = [
+            url.rstrip("/")
+            for url in LIQUID_BACKEND_URLS["testnet"]
+            if url.startswith(("http://", "https://"))
+        ]
+        assert _esplora_bases("testnet") == expected
+
+    def test_electrum_entries_are_filtered_out(self, monkeypatch):
+        """ssl:// / tcp:// entries cannot be queried over HTTP and are dropped."""
+        import aqua.tools as tools_module
+
+        monkeypatch.setattr(
+            tools_module,
+            "LIQUID_BACKEND_URLS",
+            {"mainnet": ["ssl://electrum.example:50002", FIRST_BACKEND]},
+        )
+        assert _esplora_bases("mainnet") == [FIRST_BACKEND]
+
+    def test_trailing_slash_stripped(self, monkeypatch):
+        import aqua.tools as tools_module
+
+        monkeypatch.setattr(
+            tools_module, "LIQUID_BACKEND_URLS", {"mainnet": [FIRST_BACKEND + "/"]}
+        )
+        assert _esplora_bases("mainnet") == [FIRST_BACKEND]
+
+    def test_falls_back_to_blockstream_when_no_http_backend(self, monkeypatch):
+        """An all-Electrum backend list still leaves a queryable Esplora base."""
+        import aqua.tools as tools_module
+
+        monkeypatch.setattr(
+            tools_module,
+            "LIQUID_BACKEND_URLS",
+            {"mainnet": ["ssl://electrum.example:50002"]},
+        )
+        assert _esplora_bases("mainnet") == [ESPLORA_URLS["mainnet"]]
+
+
+class TestTxStatusBackendFallback:
+    def test_first_backend_unreachable_second_answers(self, two_backends):
+        """A dead first backend falls through instead of failing the call."""
+        routes = {
+            FIRST_BACKEND: urllib.error.URLError("connection refused"),
+            SECOND_BACKEND: UNCONFIRMED_TX,
+        }
+        with patch("urllib.request.urlopen", _routed_urlopen(routes)):
+            result = lw_tx_status(TX_ID)
+
+        assert result["txid"] == TX_ID
+        assert result["status"] == "unconfirmed"
+        assert result["confirmations"] == 0
+        assert result["fee"] == 42
+
+    def test_first_backend_times_out_second_answers(self, two_backends):
+        routes = {
+            FIRST_BACKEND: TimeoutError("timed out"),
+            SECOND_BACKEND: UNCONFIRMED_TX,
+        }
+        with patch("urllib.request.urlopen", _routed_urlopen(routes)):
+            result = lw_tx_status(TX_ID)
+
+        assert result["status"] == "unconfirmed"
+
+    def test_first_backend_404_second_has_tx(self, two_backends):
+        """A tx broadcast via AQUA's backend may not be on the other one yet."""
+        routes = {
+            FIRST_BACKEND: _http_error(FIRST_BACKEND, 404),
+            SECOND_BACKEND: UNCONFIRMED_TX,
+        }
+        with patch("urllib.request.urlopen", _routed_urlopen(routes)):
+            result = lw_tx_status(TX_ID)
+
+        assert result["txid"] == TX_ID
+        assert result["status"] == "unconfirmed"
+
+    def test_first_backend_500_second_answers(self, two_backends):
+        routes = {
+            FIRST_BACKEND: _http_error(FIRST_BACKEND, 503),
+            SECOND_BACKEND: UNCONFIRMED_TX,
+        }
+        with patch("urllib.request.urlopen", _routed_urlopen(routes)):
+            result = lw_tx_status(TX_ID)
+
+        assert result["status"] == "unconfirmed"
+
+    def test_first_backend_429_second_answers(self, two_backends):
+        routes = {
+            FIRST_BACKEND: _http_error(FIRST_BACKEND, 429),
+            SECOND_BACKEND: UNCONFIRMED_TX,
+        }
+        with patch("urllib.request.urlopen", _routed_urlopen(routes)):
+            result = lw_tx_status(TX_ID)
+
+        assert result["status"] == "unconfirmed"
+
+    def test_non_json_body_falls_through(self, two_backends):
+        """An HTML error page from a proxy is not a valid answer."""
+        routes = {
+            FIRST_BACKEND: "<html>502 Bad Gateway</html>",
+            SECOND_BACKEND: UNCONFIRMED_TX,
+        }
+        with patch("urllib.request.urlopen", _routed_urlopen(routes)):
+            result = lw_tx_status(TX_ID)
+
+        assert result["status"] == "unconfirmed"
+
+    def test_non_utf8_body_falls_through(self, two_backends):
+        """A 200 whose body is not UTF-8 is a bad backend, not a reason to stop.
+
+        Decoding with utf-8 strict used to raise UnicodeDecodeError here and
+        skip the remaining bases. get_transaction_hex already fell through;
+        both callers now share esplora_http_get, so this must too.
+        """
+        routes = {
+            FIRST_BACKEND: b"\xff\xfe\x00garbage",
+            SECOND_BACKEND: UNCONFIRMED_TX,
+        }
+        with patch("urllib.request.urlopen", _routed_urlopen(routes)):
+            result = lw_tx_status(TX_ID)
+
+        assert result["status"] == "unconfirmed"
+
+    def test_json_that_is_not_an_object_falls_through(self, two_backends):
+        """'null' parses as JSON but is not a transaction."""
+        routes = {FIRST_BACKEND: "null", SECOND_BACKEND: UNCONFIRMED_TX}
+        with patch("urllib.request.urlopen", _routed_urlopen(routes)):
+            result = lw_tx_status(TX_ID)
+
+        assert result["status"] == "unconfirmed"
+
+    def test_all_backends_404_reports_not_found(self, two_backends):
+        routes = {
+            FIRST_BACKEND: _http_error(FIRST_BACKEND, 404),
+            SECOND_BACKEND: _http_error(SECOND_BACKEND, 404),
+        }
+        with patch("urllib.request.urlopen", _routed_urlopen(routes)):
+            with pytest.raises(ValueError, match="Transaction not found") as exc:
+                lw_tx_status(TX_ID)
+
+        # A clean "every backend says no" keeps the original bare message.
+        assert str(exc.value) == f"Transaction not found: {TX_ID}"
+
+    def test_all_backends_unreachable_raises(self, two_backends):
+        """No fake success when every backend is down (CLAUDE.md no-lies rule)."""
+        routes = {
+            FIRST_BACKEND: urllib.error.URLError("connection refused"),
+            SECOND_BACKEND: urllib.error.URLError("dns failure"),
+        }
+        with patch("urllib.request.urlopen", _routed_urlopen(routes)):
+            with pytest.raises(ValueError, match="Could not reach any Liquid Esplora backend"):
+                lw_tx_status(TX_ID)
+
+    def test_mixed_404_and_unreachable_is_not_reported_as_not_found(self, two_backends):
+        """A 404 while another backend was unreachable is not proof the tx doesn't exist.
+
+        e.g. broadcast via Airavata, Airavata down, Blockstream hasn't seen it yet.
+        """
+        routes = {
+            FIRST_BACKEND: urllib.error.URLError("connection refused"),
+            SECOND_BACKEND: _http_error(SECOND_BACKEND, 404),
+        }
+        with patch("urllib.request.urlopen", _routed_urlopen(routes)):
+            with pytest.raises(
+                ValueError, match="Could not reach any Liquid Esplora backend"
+            ) as exc:
+                lw_tx_status(TX_ID)
+
+        assert "not found" not in str(exc.value).lower()
+        assert FIRST_BACKEND in str(exc.value)
+        assert f"{SECOND_BACKEND}: HTTP 404" in str(exc.value)
+
+    def test_definitive_http_error_surfaces(self, two_backends):
+        """A 400 is an application error, not a reason to try the next backend."""
+        routes = {FIRST_BACKEND: _http_error(FIRST_BACKEND, 400)}
+        with patch("urllib.request.urlopen", _routed_urlopen(routes)):
+            with pytest.raises(ValueError, match="Esplora API error"):
+                lw_tx_status(TX_ID)
+
+    def test_explorer_url_stays_blockstream(self, two_backends):
+        """The display link is canonical, whichever backend answered."""
+        routes = {
+            FIRST_BACKEND: urllib.error.URLError("down"),
+            SECOND_BACKEND: UNCONFIRMED_TX,
+        }
+        with patch("urllib.request.urlopen", _routed_urlopen(routes)):
+            result = lw_tx_status(TX_ID)
+
+        assert result["explorer_url"] == f"https://blockstream.info/liquid/tx/{TX_ID}"
+
+    def test_confirmed_tx_tip_height_also_falls_back(self, two_backends):
+        """The tip query gets the same fallback as the tx query."""
+        routes = {
+            f"{FIRST_BACKEND}/tx/": CONFIRMED_TX,
+            f"{FIRST_BACKEND}/blocks/tip/height": urllib.error.URLError("down"),
+            f"{SECOND_BACKEND}/blocks/tip/height": "105",
+        }
+        with patch("urllib.request.urlopen", _routed_urlopen(routes)):
+            result = lw_tx_status(TX_ID)
+
+        assert result["status"] == "confirmed"
+        assert result["block_height"] == 100
+        assert result["confirmations"] == 6
+
+    def test_lagging_tip_backend_never_yields_zero_confirmations(self, two_backends):
+        """A confirmed tx has >= 1 confirmation even if the tip backend lags behind."""
+        routes = {
+            f"{FIRST_BACKEND}/tx/": CONFIRMED_TX,
+            f"{FIRST_BACKEND}/blocks/tip/height": urllib.error.URLError("down"),
+            f"{SECOND_BACKEND}/blocks/tip/height": "98",  # two blocks behind the tx
+        }
+        with patch("urllib.request.urlopen", _routed_urlopen(routes)):
+            result = lw_tx_status(TX_ID)
+
+        assert result["status"] == "confirmed"
+        assert result["confirmations"] >= 1
+
+    def test_read_phase_connection_reset_falls_through(self, two_backends):
+        """A reset during the response body read is transient, not fatal."""
+        routes = {
+            FIRST_BACKEND: ConnectionResetError("connection reset by peer"),
+            SECOND_BACKEND: UNCONFIRMED_TX,
+        }
+        with patch("urllib.request.urlopen", _routed_urlopen(routes)):
+            result = lw_tx_status(TX_ID)
+
+        assert result["status"] == "unconfirmed"
+
+    def test_confirmed_tx_survives_total_tip_failure(self, two_backends):
+        """Tip unavailable degrades to a warning, it does not fail the status call."""
+        routes = {
+            f"{FIRST_BACKEND}/tx/": CONFIRMED_TX,
+            f"{FIRST_BACKEND}/blocks/tip/height": urllib.error.URLError("down"),
+            f"{SECOND_BACKEND}/blocks/tip/height": urllib.error.URLError("down"),
+        }
+        with patch("urllib.request.urlopen", _routed_urlopen(routes)):
+            result = lw_tx_status(TX_ID)
+
+        assert result["status"] == "confirmed"
+        assert result["confirmations"] is None
+        assert "warning" in result
+
+
+# ---------------------------------------------------------------------------
+# _parse_tx_input  # Significance: 4 (Important)
+# ---------------------------------------------------------------------------
+
+
+class TestParseTxInput:
+    def test_liquid_network_mainnet_url(self):
+        assert _parse_tx_input(f"https://liquid.network/tx/{TX_ID}") == (TX_ID, "mainnet")
+
+    def test_liquid_network_testnet_url(self):
+        assert _parse_tx_input(f"https://liquid.network/liquidtestnet/tx/{TX_ID}") == (
+            TX_ID,
+            "testnet",
+        )
+
+    def test_blockstream_mainnet_url_still_works(self):
+        assert _parse_tx_input(f"https://blockstream.info/liquid/tx/{TX_ID}") == (
+            TX_ID,
+            "mainnet",
+        )
+
+    def test_blockstream_testnet_url_still_works(self):
+        assert _parse_tx_input(f"https://blockstream.info/liquidtestnet/tx/{TX_ID}") == (
+            TX_ID,
+            "testnet",
+        )
+
+    def test_raw_txid_defaults_to_mainnet(self):
+        assert _parse_tx_input(f"  {TX_ID}  ") == (TX_ID, "mainnet")
+
+    def test_garbage_raises(self):
+        with pytest.raises(ValueError, match="Invalid input"):
+            _parse_tx_input("not-a-txid")

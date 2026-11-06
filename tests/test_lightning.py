@@ -1,0 +1,2023 @@
+"""Tests for Lightning abstraction layer (new unified interface)."""
+
+import json
+import tempfile
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+from datetime import datetime, UTC
+
+import pytest
+import wallycore as wally
+from coincurve import PrivateKey
+
+from aqua.boltz_refund import build_swap_tree
+from aqua.bolt11 import decode_bolt11_payment_hash
+from aqua.lightning import (
+    MAX_SWAP_TIMEOUT_DELTA_BLOCKS,
+    LightningSwap,
+    LightningManager,
+)
+from aqua.storage import Storage
+from aqua.tools import (
+    get_manager,
+    get_lightning_manager,
+    lightning_receive,
+    lightning_send,
+    lightning_transaction_status,
+)
+from aqua.wallet import WalletManager, Balance
+
+
+from tests.conftest import TEST_MNEMONIC
+
+# BOLT11 spec test vector (valid checksum); payment hash 0001...0102.
+VALID_INVOICE_MAINNET = (
+    "lnbc2500u1pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5xys"
+    "xxatsyp3k7enxv4jsxqzpuaztrnwngzn3kdzw5hydlzf03qdgm2hdq27cqv3agm2awhz5se903vrua"
+    "tfhq77w3ls4evs3ch9zw97j25emudupq63nyw24cg27h2rspfj9srp"
+)
+VALID_INVOICE_TESTNET = "lntb500u1ptest_valid_invoice"
+
+MOCK_ANKARA_CREATE_RESPONSE = {
+    "swap_id": "ankara_uuid_123",
+    "invoice": VALID_INVOICE_MAINNET,
+}
+
+MOCK_ANKARA_VERIFY_SETTLED = {
+    "settled": True,
+    "preimage": "aa" * 32,
+}
+
+MOCK_ANKARA_VERIFY_PENDING = {
+    "settled": False,
+}
+
+MOCK_BOLTZ_SUBMARINE_PAIRS = {
+    "L-BTC": {
+        "BTC": {
+            "rate": 1.0,
+            "fees": {"percentage": 0.1, "minerFees": 19},
+            "limits": {"maximal": 25000000, "minimal": 100},
+        }
+    }
+}
+
+REFUND_PRIVKEY = "11" * 32
+REFUND_PUBKEY = PrivateKey(bytes.fromhex(REFUND_PRIVKEY)).public_key.format().hex()
+REFUND_KEYPAIR = (REFUND_PRIVKEY, REFUND_PUBKEY)
+CLAIM_PUBKEY = PrivateKey(bytes.fromhex("22" * 32)).public_key.format().hex()
+BLINDING_KEY = "33" * 32
+TIMEOUT_HEIGHT = 2500000
+
+
+def _lockup_address(refund_pubkey=REFUND_PUBKEY, blinding_key=BLINDING_KEY):
+    """A real confidential mainnet address over the honest swap tree's output."""
+    tree = build_swap_tree(
+        bytes.fromhex(decode_bolt11_payment_hash(VALID_INVOICE_MAINNET)),
+        bytes.fromhex(CLAIM_PUBKEY),
+        bytes.fromhex(refund_pubkey),
+        TIMEOUT_HEIGHT,
+    )
+    unconfidential = wally.addr_segwit_from_bytes(tree.scriptpubkey, "ex", 0)
+    return wally.confidential_addr_from_addr_segwit(
+        unconfidential,
+        "ex",
+        "lq",
+        PrivateKey(bytes.fromhex(blinding_key)).public_key.format(),
+    )
+
+
+MOCK_BOLTZ_SWAP_RESPONSE = {
+    "id": "boltz_swap_123",
+    "address": _lockup_address(),
+    "expectedAmount": 50069,
+    "claimPublicKey": CLAIM_PUBKEY,
+    "blindingKey": BLINDING_KEY,
+    "swapTree": {
+        "claimLeaf": {"version": 192, "output": "a914..."},
+        "refundLeaf": {"version": 192, "output": "b914..."},
+    },
+    "timeoutBlockHeight": TIMEOUT_HEIGHT,
+}
+
+
+def _mock_response(data, status=200):
+    """Create a mock urllib response (context manager)."""
+    resp = MagicMock()
+    if isinstance(data, dict):
+        resp.read.return_value = json.dumps(data).encode()
+    else:
+        resp.read.return_value = data
+    resp.__enter__ = MagicMock(return_value=resp)
+    resp.__exit__ = MagicMock(return_value=False)
+    return resp
+
+
+@pytest.fixture(autouse=True)
+def isolated_managers():
+    """Replace global managers with temp storage."""
+    import aqua.tools as tools_module
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        storage = Storage(Path(tmpdir))
+        manager = WalletManager(storage=storage)
+        tools_module._manager = manager
+        tools_module._btc_manager = None
+        tools_module._lightning_manager = None
+        yield manager
+        tools_module._manager = None
+        tools_module._btc_manager = None
+        tools_module._lightning_manager = None
+
+
+@pytest.fixture(autouse=True)
+def chain_tip():
+    """Liquid tip inside the honest swap's timeout window."""
+    with patch(
+        "aqua.wallet.WalletManager.get_block_height", return_value=TIMEOUT_HEIGHT - 1_000
+    ) as m:
+        yield m
+
+
+@pytest.fixture
+def test_wallet(isolated_managers):
+    """Create a test wallet with balance."""
+    isolated_managers.import_mnemonic(TEST_MNEMONIC, "default", "mainnet")
+    return isolated_managers.load_wallet("default")
+
+
+class TestLightningSwap:
+    """Tests for LightningSwap dataclass."""
+
+    def test_to_dict_includes_all_fields(self):
+        """to_dict() returns complete dict including internal fields."""
+        swap = LightningSwap(
+            swap_id="test_123",
+            swap_type="receive",
+            provider="ankara",
+            invoice="lnbc...",
+            amount=100000,
+            wallet_name="default",
+            status="pending",
+            network="mainnet",
+            created_at="2026-03-12T00:00:00+00:00",
+            receive_address="lq1...",
+            preimage="aa" * 32,
+            refund_private_key="secret",
+        )
+        data = swap.to_dict()
+
+        assert data["swap_id"] == "test_123"
+        assert data["swap_type"] == "receive"
+        assert data["provider"] == "ankara"
+        assert data["receive_address"] == "lq1..."
+        assert data["preimage"] == "aa" * 32
+        assert data["refund_private_key"] == "secret"
+
+    def test_from_dict_roundtrip(self):
+        """from_dict() reconstructs from to_dict() output."""
+        swap = LightningSwap(
+            swap_id="test_123",
+            swap_type="send",
+            provider="boltz",
+            invoice="lnbc...",
+            amount=100000,
+            wallet_name="default",
+            status="processing",
+            network="mainnet",
+            created_at="2026-03-12T00:00:00+00:00",
+            lockup_txid="abc123",
+            timeout_block_height=2500000,
+            refund_private_key="secret",
+        )
+        data = swap.to_dict()
+        restored = LightningSwap.from_dict(data)
+
+        assert restored.swap_id == swap.swap_id
+        assert restored.lockup_txid == swap.lockup_txid
+        assert restored.timeout_block_height == swap.timeout_block_height
+
+    def test_from_dict_compat_missing_optional_fields(self):
+        """from_dict() handles missing optional fields with backward compat."""
+        data = {
+            "swap_id": "test_123",
+            "swap_type": "receive",
+            "provider": "ankara",
+            "invoice": "lnbc...",
+            "amount": 100000,
+            "wallet_name": "default",
+            "status": "pending",
+            "network": "mainnet",
+            "created_at": "2026-03-12T00:00:00+00:00",
+        }
+        # Missing: receive_address, preimage, lockup_txid, claim_txid, refund_private_key, timeout_block_height
+        swap = LightningSwap.from_dict(data)
+
+        assert swap.receive_address is None
+        assert swap.preimage is None
+        assert swap.refund_private_key is None
+
+
+class TestLightningManagerReceive:
+    """Tests for LightningManager.create_receive_invoice()."""
+
+    def test_receive_happy_path(self, test_wallet, isolated_managers):
+        """Happy path: valid amount, wallet exists, creates and persists swap."""
+        manager = get_lightning_manager()
+
+        with patch("aqua.lightning.AnkaraClient") as mock_ankara:
+            mock_client = MagicMock()
+            mock_ankara.return_value = mock_client
+            mock_client.create_swap.return_value = MOCK_ANKARA_CREATE_RESPONSE
+
+            swap = manager.create_receive_invoice(100000, "default")
+
+            assert swap.swap_id == "ankara_uuid_123"
+            assert swap.swap_type == "receive"
+            assert swap.provider == "ankara"
+            assert swap.status == "pending"
+            assert swap.amount == 100000
+            assert swap.invoice == VALID_INVOICE_MAINNET
+            assert swap.receive_address is not None
+
+            loaded = isolated_managers.storage.load_lightning_swap(swap.swap_id)
+            assert loaded is not None
+            assert loaded.swap_id == swap.swap_id
+
+    def test_receive_amount_too_low(self, test_wallet):
+        """Amount below minimum raises ValueError."""
+        manager = get_lightning_manager()
+
+        with pytest.raises(ValueError, match="below minimum"):
+            manager.create_receive_invoice(50, "default")
+
+    def test_receive_amount_too_high(self, test_wallet):
+        """Amount above maximum raises ValueError."""
+        manager = get_lightning_manager()
+
+        with pytest.raises(ValueError, match="exceeds maximum"):
+            manager.create_receive_invoice(30_000_000, "default")
+
+    def test_receive_wallet_not_found(self):
+        """Non-existent wallet raises ValueError."""
+        manager = get_lightning_manager()
+
+        with pytest.raises(ValueError, match="not found"):
+            manager.create_receive_invoice(100000, "nonexistent")
+
+    def test_receive_watch_only_wallet(self, isolated_managers):
+        """Watch-only wallet raises ValueError."""
+        manager = get_lightning_manager()
+        isolated_managers.import_descriptor(
+            "ct(slip77(abcd),elwpkh([00000000]xpub...))",
+            "watch_only",
+            "mainnet",
+        )
+
+        with pytest.raises(ValueError, match="cannot receive"):
+            manager.create_receive_invoice(100000, "watch_only")
+
+    def test_receive_encrypted_wallet_no_password(self, isolated_managers):
+        """Encrypted wallet without password raises ValueError."""
+        manager = get_lightning_manager()
+        isolated_managers.import_mnemonic(
+            TEST_MNEMONIC, "encrypted", "mainnet", password="test-pass"
+        )
+
+        with pytest.raises(ValueError, match="Password required"):
+            manager.create_receive_invoice(100000, "encrypted")
+
+    def test_receive_api_error_propagates(self, test_wallet):
+        """Ankara API error is wrapped and propagated."""
+        manager = get_lightning_manager()
+
+        with patch("aqua.lightning.AnkaraClient") as mock_ankara:
+            mock_client = MagicMock()
+            mock_ankara.return_value = mock_client
+            mock_client.create_swap.side_effect = RuntimeError("API error")
+
+            with pytest.raises(RuntimeError, match="Failed to create Ankara swap"):
+                manager.create_receive_invoice(100000, "default")
+
+
+class TestLightningManagerSend:
+    """Tests for LightningManager.pay_invoice()."""
+
+    @patch("aqua.lightning.generate_keypair")
+    @patch.object(
+        type(get_manager()),
+        "get_balance",
+        return_value=[
+            Balance(
+                asset_id="policy_asset",
+                asset_name="L-BTC",
+                ticker="L-BTC",
+                amount=100000,
+            )
+        ],
+    )
+    @patch("aqua.lightning.decode_bolt11_amount_sats")
+    @patch("aqua.indra.IndraClient")
+    @patch("aqua.wallet.WalletManager.send")
+    def test_send_happy_path(
+        self,
+        mock_send,
+        mock_boltz,
+        mock_decode,
+        mock_get_balance,
+        mock_keygen,
+        test_wallet,
+        isolated_managers,
+    ):
+        """Happy path: valid invoice, creates swap and sends L-BTC."""
+        mock_send.return_value = "lockup_txid_123"
+        mock_keygen.return_value = REFUND_KEYPAIR
+
+        manager = get_lightning_manager()
+
+        mock_boltz_client = MagicMock()
+        mock_boltz.return_value = mock_boltz_client
+        mock_boltz_client.get_submarine_pairs.return_value = MOCK_BOLTZ_SUBMARINE_PAIRS
+        mock_boltz_client.create_submarine_swap.return_value = MOCK_BOLTZ_SWAP_RESPONSE
+        mock_decode.return_value = 50000
+
+        swap = manager.pay_invoice(VALID_INVOICE_MAINNET, "default")
+
+        assert swap.swap_id == "boltz_swap_123"
+        assert swap.swap_type == "send"
+        assert swap.provider == "indra"
+        assert swap.status == "processing"
+        assert swap.lockup_txid == "lockup_txid_123"
+        assert swap.refund_private_key == REFUND_PRIVKEY
+
+        loaded = isolated_managers.storage.load_lightning_swap(swap.swap_id)
+        assert loaded is not None
+
+    def test_send_invalid_invoice_format(self, test_wallet):
+        """Invalid invoice format raises ValueError."""
+        manager = get_lightning_manager()
+
+        with pytest.raises(ValueError, match="Invalid invoice"):
+            manager.pay_invoice("invalid", "default")
+
+    def test_send_wallet_not_found(self):
+        """Non-existent wallet raises ValueError."""
+        manager = get_lightning_manager()
+
+        with pytest.raises(ValueError, match="not found"):
+            manager.pay_invoice(VALID_INVOICE_MAINNET, "nonexistent")
+
+    def test_send_watch_only_wallet(self, isolated_managers):
+        """Watch-only wallet raises ValueError."""
+        manager = get_lightning_manager()
+        isolated_managers.import_descriptor(
+            "ct(slip77(abcd),elwpkh([00000000]xpub...))",
+            "watch_only",
+            "mainnet",
+        )
+
+        with pytest.raises(ValueError, match="cannot sign"):
+            manager.pay_invoice(VALID_INVOICE_MAINNET, "watch_only")
+
+    def test_send_amount_validation(self, test_wallet):
+        """Invoice amount outside limits raises ValueError."""
+        manager = get_lightning_manager()
+
+        with patch("aqua.lightning.decode_bolt11_amount_sats") as mock_decode:
+            mock_decode.return_value = 50  # Below minimum
+
+            with pytest.raises(ValueError, match="below minimum"):
+                manager.pay_invoice(VALID_INVOICE_MAINNET, "default")
+
+    @patch("aqua.lightning.generate_keypair")
+    @patch.object(
+        type(get_manager()),
+        "get_balance",
+        return_value=[],  # No balance
+    )
+    @patch("aqua.lightning.decode_bolt11_amount_sats")
+    @patch("aqua.indra.IndraClient")
+    def test_send_insufficient_balance(
+        self, mock_boltz, mock_decode, mock_get_balance, mock_keygen, test_wallet
+    ):
+        """Insufficient L-BTC balance raises ValueError using expected_amount (post-Boltz)."""
+        mock_keygen.return_value = REFUND_KEYPAIR
+        mock_decode.return_value = 50000
+
+        mock_boltz_client = MagicMock()
+        mock_boltz.return_value = mock_boltz_client
+        mock_boltz_client.get_submarine_pairs.return_value = MOCK_BOLTZ_SUBMARINE_PAIRS
+        mock_boltz_client.create_submarine_swap.return_value = MOCK_BOLTZ_SWAP_RESPONSE
+
+        manager = get_lightning_manager()
+
+        with pytest.raises(ValueError, match="Insufficient L-BTC balance"):
+            manager.pay_invoice(VALID_INVOICE_MAINNET, "default")
+
+    @patch.object(
+        type(get_manager()),
+        "get_balance",
+        return_value=[
+            Balance(
+                asset_id="policy_asset",
+                asset_name="L-BTC",
+                ticker="L-BTC",
+                amount=100000,
+            )
+        ],
+    )
+    @patch("aqua.lightning.decode_bolt11_amount_sats")
+    @patch("aqua.indra.IndraClient")
+    def test_send_pair_not_available(
+        self, mock_boltz, mock_decode, mock_get_balance, test_wallet
+    ):
+        """Boltz pair unavailable raises ValueError."""
+        mock_boltz_client = MagicMock()
+        mock_boltz.return_value = mock_boltz_client
+        mock_boltz_client.get_submarine_pairs.return_value = {}
+        mock_decode.return_value = 100000
+
+        manager = get_lightning_manager()
+
+        with pytest.raises(ValueError, match="pair not available"):
+            manager.pay_invoice(VALID_INVOICE_MAINNET, "default")
+
+    @patch("aqua.lightning.generate_keypair")
+    @patch.object(
+        type(get_manager()),
+        "send",
+        side_effect=None,  # Will be set in method
+    )
+    @patch.object(
+        type(get_manager()),
+        "get_balance",
+        return_value=[
+            Balance(
+                asset_id="policy_asset",
+                asset_name="L-BTC",
+                ticker="L-BTC",
+                amount=100000,
+            )
+        ],
+    )
+    @patch("aqua.lightning.decode_bolt11_amount_sats")
+    @patch("aqua.indra.IndraClient")
+    def test_send_persists_before_sending(
+        self,
+        mock_boltz,
+        mock_decode,
+        mock_get_balance,
+        mock_send,
+        mock_keygen,
+        test_wallet,
+        isolated_managers,
+    ):
+        """Swap is persisted to disk BEFORE sending L-BTC."""
+        send_called = False
+
+        def mock_send_impl(wallet, addr, amount, password=None):
+            nonlocal send_called
+            send_called = True
+            swaps = isolated_managers.storage.list_lightning_swaps()
+            assert len(swaps) > 0
+            return "txid"
+
+        mock_send.side_effect = mock_send_impl
+        mock_keygen.return_value = REFUND_KEYPAIR
+
+        manager = get_lightning_manager()
+
+        mock_boltz_client = MagicMock()
+        mock_boltz.return_value = mock_boltz_client
+        mock_boltz_client.get_submarine_pairs.return_value = MOCK_BOLTZ_SUBMARINE_PAIRS
+        mock_boltz_client.create_submarine_swap.return_value = MOCK_BOLTZ_SWAP_RESPONSE
+        mock_decode.return_value = 50000
+
+        manager.pay_invoice(VALID_INVOICE_MAINNET, "default")
+
+        assert send_called
+
+    @patch("aqua.lightning.generate_keypair")
+    @patch.object(
+        type(get_manager()),
+        "get_balance",
+        return_value=[
+            Balance(
+                asset_id="policy_asset",
+                asset_name="L-BTC",
+                ticker="L-BTC",
+                amount=100000,
+            )
+        ],
+    )
+    @patch("aqua.lightning.decode_bolt11_amount_sats")
+    @patch("aqua.indra.IndraClient")
+    @patch("aqua.wallet.WalletManager.send")
+    def test_pay_invoice_accepts_uppercase_bolt11(
+        self,
+        mock_send,
+        mock_boltz,
+        mock_decode,
+        mock_get_balance,
+        mock_keygen,
+        test_wallet,
+    ):
+        """Uppercase BOLT11 invoices are accepted and lowercased before reaching Boltz."""
+        mock_send.return_value = "lockup_txid_123"
+        mock_keygen.return_value = REFUND_KEYPAIR
+
+        manager = get_lightning_manager()
+
+        mock_boltz_client = MagicMock()
+        mock_boltz.return_value = mock_boltz_client
+        mock_boltz_client.get_submarine_pairs.return_value = MOCK_BOLTZ_SUBMARINE_PAIRS
+        mock_boltz_client.create_submarine_swap.return_value = MOCK_BOLTZ_SWAP_RESPONSE
+        mock_decode.return_value = 50000
+
+        swap = manager.pay_invoice(VALID_INVOICE_MAINNET.upper(), "default")
+
+        assert swap.swap_id == "boltz_swap_123"
+        called_invoice = mock_boltz_client.create_submarine_swap.call_args.args[0]
+        assert called_invoice == VALID_INVOICE_MAINNET
+
+
+class TestLightningManagerSendLNAddress:
+    """Tests for Lightning Address routing in LightningManager.pay_invoice()."""
+
+    def test_lightning_address_routes_through_resolver(self, test_wallet):
+        """LN address input invokes resolve_lightning_address with (address, amount)."""
+        manager = get_lightning_manager()
+
+        with patch("aqua.lightning.resolve_lightning_address") as mock_resolve, patch(
+            "aqua.lightning.decode_bolt11_amount_sats", return_value=50_000
+        ), patch.object(
+            type(get_manager()),
+            "get_balance",
+            return_value=[
+                Balance(
+                    asset_id="policy_asset",
+                    asset_name="L-BTC",
+                    ticker="L-BTC",
+                    amount=200_000,
+                )
+            ],
+        ), patch("aqua.indra.IndraClient") as mock_boltz, patch(
+            "aqua.lightning.generate_keypair", return_value=REFUND_KEYPAIR
+        ), patch("aqua.wallet.WalletManager.send", return_value="lockup_txid"):
+            mock_resolve.return_value = VALID_INVOICE_MAINNET
+            mock_client = MagicMock()
+            mock_boltz.return_value = mock_client
+            mock_client.get_submarine_pairs.return_value = MOCK_BOLTZ_SUBMARINE_PAIRS
+            mock_client.create_submarine_swap.return_value = MOCK_BOLTZ_SWAP_RESPONSE
+
+            swap = manager.pay_invoice(
+                "alice@getalby.com", "default", amount_sats=50_000
+            )
+
+            mock_resolve.assert_called_once_with("alice@getalby.com", 50_000)
+            assert swap.invoice == VALID_INVOICE_MAINNET
+
+    def test_lightning_address_requires_amount_sats(self, test_wallet):
+        """LN address without amount_sats raises ValueError."""
+        manager = get_lightning_manager()
+        with patch("aqua.lightning.resolve_lightning_address") as mock_resolve:
+            with pytest.raises(ValueError, match="amount_sats is required"):
+                manager.pay_invoice("alice@getalby.com", "default")
+            mock_resolve.assert_not_called()
+
+    def test_lightning_address_amount_outside_provider_limits_raises_early(self, test_wallet):
+        """amount_sats below the provider min raises before any HTTP call."""
+        manager = get_lightning_manager()
+        with patch("aqua.lightning.resolve_lightning_address") as mock_resolve:
+            with pytest.raises(ValueError, match="outside Indra limits"):
+                manager.pay_invoice("alice@getalby.com", "default", amount_sats=50)
+            mock_resolve.assert_not_called()
+
+    def test_lightning_address_amount_above_provider_max_raises_early(self, test_wallet):
+        """amount_sats above the provider max raises before any HTTP call."""
+        manager = get_lightning_manager()
+        with patch("aqua.lightning.resolve_lightning_address") as mock_resolve:
+            with pytest.raises(ValueError, match="outside Indra limits"):
+                manager.pay_invoice(
+                    "alice@getalby.com", "default", amount_sats=30_000_000
+                )
+            mock_resolve.assert_not_called()
+
+    def test_bolt11_with_matching_amount_sats_passes(self, test_wallet):
+        """BOLT11 with matching amount_sats works exactly like no amount_sats."""
+        manager = get_lightning_manager()
+        with patch.object(
+            type(get_manager()),
+            "get_balance",
+            return_value=[
+                Balance(
+                    asset_id="policy_asset",
+                    asset_name="L-BTC",
+                    ticker="L-BTC",
+                    amount=200_000,
+                )
+            ],
+        ), patch(
+            "aqua.lightning.decode_bolt11_amount_sats", return_value=50_000
+        ), patch("aqua.indra.IndraClient") as mock_boltz, patch(
+            "aqua.lightning.generate_keypair", return_value=REFUND_KEYPAIR
+        ), patch("aqua.wallet.WalletManager.send", return_value="lockup_txid"):
+            mock_client = MagicMock()
+            mock_boltz.return_value = mock_client
+            mock_client.get_submarine_pairs.return_value = MOCK_BOLTZ_SUBMARINE_PAIRS
+            mock_client.create_submarine_swap.return_value = MOCK_BOLTZ_SWAP_RESPONSE
+
+            swap = manager.pay_invoice(
+                VALID_INVOICE_MAINNET, "default", amount_sats=50_000
+            )
+            assert swap.swap_id == "boltz_swap_123"
+
+    def test_bolt11_with_mismatching_amount_sats_raises(self, test_wallet):
+        """BOLT11 + amount_sats that disagree → ValueError."""
+        manager = get_lightning_manager()
+        with patch(
+            "aqua.lightning.decode_bolt11_amount_sats", return_value=50_000
+        ):
+            with pytest.raises(ValueError, match="does not match BOLT11 invoice"):
+                manager.pay_invoice(
+                    VALID_INVOICE_MAINNET, "default", amount_sats=99_999
+                )
+
+    def test_amountless_bolt11_rejected(self, test_wallet):
+        """Amountless BOLT11 is rejected before any Boltz HTTP call."""
+        manager = get_lightning_manager()
+        with patch(
+            "aqua.lightning.decode_bolt11_amount_sats", return_value=None
+        ), patch("aqua.indra.IndraClient") as mock_boltz:
+            with pytest.raises(ValueError, match="Amountless BOLT11"):
+                manager.pay_invoice(VALID_INVOICE_MAINNET, "default")
+            mock_boltz.assert_not_called()
+
+    def test_amountless_bolt11_rejected_even_with_amount_sats(self, test_wallet):
+        """Passing amount_sats does not unlock an amountless BOLT11."""
+        manager = get_lightning_manager()
+        with patch(
+            "aqua.lightning.decode_bolt11_amount_sats", return_value=None
+        ), patch("aqua.indra.IndraClient") as mock_boltz:
+            with pytest.raises(ValueError, match="Amountless BOLT11"):
+                manager.pay_invoice(
+                    VALID_INVOICE_MAINNET, "default", amount_sats=50_000
+                )
+            mock_boltz.assert_not_called()
+
+
+class TestLightningManagerReceiveStatus:
+    """Tests for LightningManager.get_receive_status()."""
+
+    def test_status_pending_to_completed_auto_claim(self, test_wallet, isolated_managers):
+        """Settled swap auto-claims and updates status."""
+        manager = get_lightning_manager()
+
+        with patch("aqua.lightning.AnkaraClient") as mock_ankara:
+            mock_client = MagicMock()
+            mock_ankara.return_value = mock_client
+            mock_client.create_swap.return_value = MOCK_ANKARA_CREATE_RESPONSE
+
+            swap = manager.create_receive_invoice(100000, "default")
+            swap_id = swap.swap_id
+
+        with patch("aqua.lightning.AnkaraClient") as mock_ankara:
+            mock_client = MagicMock()
+            mock_ankara.return_value = mock_client
+            mock_client.verify_swap.return_value = MOCK_ANKARA_VERIFY_SETTLED
+            mock_client.claim_swap.return_value = {}
+
+            result = manager.get_receive_status(swap_id)
+
+            assert result["status"] == "completed"
+            assert result["preimage"] == "aa" * 32
+            assert "claim_warning" not in result
+
+            loaded = isolated_managers.storage.load_lightning_swap(swap_id)
+            assert loaded.status == "completed"
+            assert loaded.preimage == "aa" * 32
+
+    def test_status_pending_no_settlement(self, test_wallet, isolated_managers):
+        """Pending swap returns pending status."""
+        manager = get_lightning_manager()
+
+        with patch("aqua.lightning.AnkaraClient") as mock_ankara:
+            mock_client = MagicMock()
+            mock_ankara.return_value = mock_client
+            mock_client.create_swap.return_value = MOCK_ANKARA_CREATE_RESPONSE
+            swap = manager.create_receive_invoice(100000, "default")
+            swap_id = swap.swap_id
+
+            mock_client.verify_swap.return_value = MOCK_ANKARA_VERIFY_PENDING
+
+            result = manager.get_receive_status(swap_id)
+
+            assert result["status"] == "pending"
+            assert "preimage" not in result
+
+    def test_status_settled_but_claim_fails_gracefully(self, test_wallet, isolated_managers):
+        """Claim failure adds warning."""
+        manager = get_lightning_manager()
+
+        with patch("aqua.lightning.AnkaraClient") as mock_ankara:
+            mock_client = MagicMock()
+            mock_ankara.return_value = mock_client
+            mock_client.create_swap.return_value = MOCK_ANKARA_CREATE_RESPONSE
+            swap = manager.create_receive_invoice(100000, "default")
+            swap_id = swap.swap_id
+
+            mock_client.verify_swap.return_value = MOCK_ANKARA_VERIFY_SETTLED
+            mock_client.claim_swap.side_effect = RuntimeError("Claim API error")
+
+            result = manager.get_receive_status(swap_id)
+
+            assert "claim_warning" in result
+            assert "Claim API error" in result["claim_warning"]
+
+    def test_status_409_already_claimed_completes_swap(self, test_wallet, isolated_managers):
+        """409 'already claimed' from Ankara is treated as successful completion."""
+        manager = get_lightning_manager()
+
+        with patch("aqua.lightning.AnkaraClient") as mock_ankara:
+            mock_client = MagicMock()
+            mock_ankara.return_value = mock_client
+            mock_client.create_swap.return_value = MOCK_ANKARA_CREATE_RESPONSE
+            swap = manager.create_receive_invoice(100000, "default")
+            swap_id = swap.swap_id
+
+            mock_client.verify_swap.return_value = MOCK_ANKARA_VERIFY_SETTLED
+            mock_client.claim_swap.side_effect = RuntimeError(
+                "Ankara API error (409 POST /api/v1/lightning/swaps/"
+                f"{swap_id}/claim/): Swap has already been claimed."
+            )
+
+            result = manager.get_receive_status(swap_id)
+
+            assert result["status"] == "completed"
+            assert result["preimage"] == "aa" * 32
+            assert "claim_warning" not in result
+
+            loaded = isolated_managers.storage.load_lightning_swap(swap_id)
+            assert loaded.status == "completed"
+            assert loaded.preimage == "aa" * 32
+
+    def test_status_409_idempotent_second_check(self, test_wallet, isolated_managers):
+        """After 409 completes the swap, subsequent checks skip claiming."""
+        manager = get_lightning_manager()
+
+        with patch("aqua.lightning.AnkaraClient") as mock_ankara:
+            mock_client = MagicMock()
+            mock_ankara.return_value = mock_client
+            mock_client.create_swap.return_value = MOCK_ANKARA_CREATE_RESPONSE
+            swap = manager.create_receive_invoice(100000, "default")
+            swap_id = swap.swap_id
+
+            mock_client.verify_swap.return_value = MOCK_ANKARA_VERIFY_SETTLED
+            mock_client.claim_swap.side_effect = RuntimeError(
+                "Ankara API error (409 POST /api/v1/lightning/swaps/"
+                f"{swap_id}/claim/): Swap has already been claimed."
+            )
+
+            result1 = manager.get_receive_status(swap_id)
+            assert result1["status"] == "completed"
+
+            mock_client.claim_swap.reset_mock()
+            result2 = manager.get_receive_status(swap_id)
+
+            assert result2["status"] == "completed"
+            mock_client.claim_swap.assert_not_called()
+
+    def test_status_real_error_still_warns(self, test_wallet, isolated_managers):
+        """Non-409 errors (e.g. 500) keep status pending with claim_warning."""
+        manager = get_lightning_manager()
+
+        with patch("aqua.lightning.AnkaraClient") as mock_ankara:
+            mock_client = MagicMock()
+            mock_ankara.return_value = mock_client
+            mock_client.create_swap.return_value = MOCK_ANKARA_CREATE_RESPONSE
+            swap = manager.create_receive_invoice(100000, "default")
+            swap_id = swap.swap_id
+
+            mock_client.verify_swap.return_value = MOCK_ANKARA_VERIFY_SETTLED
+            mock_client.claim_swap.side_effect = RuntimeError(
+                "Ankara API error (500 POST /api/v1/lightning/swaps/"
+                f"{swap_id}/claim/): Internal Server Error"
+            )
+
+            result = manager.get_receive_status(swap_id)
+
+            assert result["status"] == "pending"
+            assert "claim_warning" in result
+            assert "500" in result["claim_warning"]
+
+            loaded = isolated_managers.storage.load_lightning_swap(swap_id)
+            assert loaded.status == "pending"
+
+    def test_status_send_swap_raises(self, test_wallet, isolated_managers):
+        """Querying status of a send swap raises ValueError."""
+        manager = get_lightning_manager()
+
+        swap = LightningSwap(
+            swap_id="send_swap_123",
+            swap_type="send",
+            provider="boltz",
+            invoice=VALID_INVOICE_MAINNET,
+            amount=100000,
+            wallet_name="default",
+            status="processing",
+            network="mainnet",
+            created_at=datetime.now(UTC).isoformat(),
+        )
+        isolated_managers.storage.save_lightning_swap(swap)
+
+        with pytest.raises(ValueError, match="send swap"):
+            manager.get_receive_status("send_swap_123")
+
+    def test_status_not_found_raises(self):
+        """Non-existent swap raises ValueError."""
+        manager = get_lightning_manager()
+
+        with pytest.raises(ValueError, match="not found"):
+            manager.get_receive_status("nonexistent_swap")
+
+    def test_status_api_down_returns_local_with_warning(self, test_wallet, isolated_managers):
+        """When API is down, returns local data with warning."""
+        manager = get_lightning_manager()
+
+        with patch("aqua.lightning.AnkaraClient") as mock_ankara:
+            mock_client = MagicMock()
+            mock_ankara.return_value = mock_client
+            mock_client.create_swap.return_value = MOCK_ANKARA_CREATE_RESPONSE
+            swap = manager.create_receive_invoice(100000, "default")
+            swap_id = swap.swap_id
+
+            # Simulate API down
+            mock_client.verify_swap.side_effect = RuntimeError("Connection error")
+
+            result = manager.get_receive_status(swap_id)
+
+            assert result["status"] == "pending"
+            assert "warning" in result
+            assert "Connection error" in result["warning"]
+
+
+class TestLightningManagerSendStatus:
+    """Tests for LightningManager.get_send_status()."""
+
+    def test_send_status_processing(self, test_wallet, isolated_managers):
+        """Boltz returns transaction.mempool -> status processing."""
+        manager = get_lightning_manager()
+        swap = LightningSwap(
+            swap_id="wneeB76Iu5k2",
+            swap_type="send",
+            provider="boltz",
+            invoice=VALID_INVOICE_MAINNET,
+            amount=50069,
+            wallet_name="default",
+            status="processing",
+            network="mainnet",
+            created_at=datetime.now(UTC).isoformat(),
+            lockup_txid="abc123",
+            timeout_block_height=2500000,
+        )
+        isolated_managers.storage.save_lightning_swap(swap)
+
+        with patch("aqua.boltz.BoltzClient") as mock_boltz:
+            mock_client = MagicMock()
+            mock_boltz.return_value = mock_client
+            mock_client.get_swap_status.return_value = {"status": "transaction.mempool"}
+
+            result = manager.get_send_status("wneeB76Iu5k2")
+
+            assert result["status"] == "processing"
+            assert result["provider_status"] == "transaction.mempool"
+            assert result["lockup_txid"] == "abc123"
+            assert result["swap_type"] == "send"
+
+    def test_send_status_claimed_with_preimage(self, test_wallet, isolated_managers):
+        """Boltz returns transaction.claimed, claim details has preimage."""
+        manager = get_lightning_manager()
+        swap = LightningSwap(
+            swap_id="boltz_claimed_123",
+            swap_type="send",
+            provider="boltz",
+            invoice=VALID_INVOICE_MAINNET,
+            amount=50069,
+            wallet_name="default",
+            status="processing",
+            network="mainnet",
+            created_at=datetime.now(UTC).isoformat(),
+            lockup_txid="lockup_abc",
+            timeout_block_height=2500000,
+        )
+        isolated_managers.storage.save_lightning_swap(swap)
+
+        with patch("aqua.boltz.BoltzClient") as mock_boltz:
+            mock_client = MagicMock()
+            mock_boltz.return_value = mock_client
+            mock_client.get_swap_status.return_value = {"status": "transaction.claimed"}
+            mock_client.get_claim_details.return_value = {
+                "preimage": "bb" * 32,
+                "claimTxid": "claim_txid_hex",
+            }
+
+            result = manager.get_send_status("boltz_claimed_123")
+
+            assert result["status"] == "completed"
+            assert result["provider_status"] == "transaction.claimed"
+            assert result["preimage"] == "bb" * 32
+            assert result["claim_txid"] == "claim_txid_hex"
+            loaded = isolated_managers.storage.load_lightning_swap("boltz_claimed_123")
+            assert loaded.preimage == "bb" * 32
+            assert loaded.claim_txid == "claim_txid_hex"
+
+    def test_send_status_claim_details_fails_gracefully(self, test_wallet, isolated_managers):
+        """Claimed but get_claim_details raises -> warning, no crash."""
+        manager = get_lightning_manager()
+        swap = LightningSwap(
+            swap_id="boltz_claim_fail",
+            swap_type="send",
+            provider="boltz",
+            invoice=VALID_INVOICE_MAINNET,
+            amount=50069,
+            wallet_name="default",
+            status="processing",
+            network="mainnet",
+            created_at=datetime.now(UTC).isoformat(),
+            lockup_txid="lockup_abc",
+            timeout_block_height=2500000,
+        )
+        isolated_managers.storage.save_lightning_swap(swap)
+
+        with patch("aqua.boltz.BoltzClient") as mock_boltz:
+            mock_client = MagicMock()
+            mock_boltz.return_value = mock_client
+            mock_client.get_swap_status.return_value = {"status": "transaction.claimed"}
+            mock_client.get_claim_details.side_effect = RuntimeError("Claim details API error")
+
+            result = manager.get_send_status("boltz_claim_fail")
+
+            assert result["status"] == "completed"
+            assert "warning" in result
+            assert "Claim details API error" in result["warning"]
+
+    def test_send_status_expired(self, test_wallet, isolated_managers):
+        """swap.expired -> failed + refund_info."""
+        manager = get_lightning_manager()
+        swap = LightningSwap(
+            swap_id="boltz_expired_123",
+            swap_type="send",
+            provider="boltz",
+            invoice=VALID_INVOICE_MAINNET,
+            amount=50069,
+            wallet_name="default",
+            status="processing",
+            network="mainnet",
+            created_at=datetime.now(UTC).isoformat(),
+            lockup_txid="lockup_abc",
+            timeout_block_height=2500000,
+        )
+        isolated_managers.storage.save_lightning_swap(swap)
+
+        with patch("aqua.boltz.BoltzClient") as mock_boltz:
+            mock_client = MagicMock()
+            mock_boltz.return_value = mock_client
+            mock_client.get_swap_status.return_value = {"status": "swap.expired"}
+
+            result = manager.get_send_status("boltz_expired_123")
+
+            assert result["status"] == "failed"
+            assert result["provider_status"] == "swap.expired"
+            assert "refund_info" in result
+            assert result["refund_info"]["timeout_block_height"] == 2500000
+
+    def test_send_status_api_down(self, test_wallet, isolated_managers):
+        """API fails -> returns local data + warning."""
+        manager = get_lightning_manager()
+        swap = LightningSwap(
+            swap_id="boltz_api_down",
+            swap_type="send",
+            provider="boltz",
+            invoice=VALID_INVOICE_MAINNET,
+            amount=50069,
+            wallet_name="default",
+            status="processing",
+            network="mainnet",
+            created_at=datetime.now(UTC).isoformat(),
+            lockup_txid="lockup_abc",
+            timeout_block_height=2500000,
+        )
+        isolated_managers.storage.save_lightning_swap(swap)
+
+        with patch("aqua.boltz.BoltzClient") as mock_boltz:
+            mock_client = MagicMock()
+            mock_boltz.return_value = mock_client
+            mock_client.get_swap_status.side_effect = RuntimeError("Boltz API unreachable")
+
+            result = manager.get_send_status("boltz_api_down")
+
+            assert result["status"] == "processing"
+            assert result["lockup_txid"] == "lockup_abc"
+            assert "warning" in result
+            assert "Boltz API unreachable" in result["warning"]
+
+    def test_send_status_receive_swap_raises(self, test_wallet, isolated_managers):
+        """get_send_status called on receive swap raises ValueError."""
+        manager = get_lightning_manager()
+        with patch("aqua.lightning.AnkaraClient") as mock_ankara:
+            mock_client = MagicMock()
+            mock_ankara.return_value = mock_client
+            mock_client.create_swap.return_value = MOCK_ANKARA_CREATE_RESPONSE
+            swap = manager.create_receive_invoice(100000, "default")
+
+        with pytest.raises(ValueError, match="receive swap"):
+            manager.get_send_status(swap.swap_id)
+
+
+class TestLightningManagerGetSwapStatus:
+    """Tests for LightningManager.get_swap_status() router."""
+
+    def test_routes_receive_to_get_receive_status(self, test_wallet, isolated_managers):
+        """Router dispatches receive swap to get_receive_status."""
+        manager = get_lightning_manager()
+        with patch("aqua.lightning.AnkaraClient") as mock_ankara:
+            mock_client = MagicMock()
+            mock_ankara.return_value = mock_client
+            mock_client.create_swap.return_value = MOCK_ANKARA_CREATE_RESPONSE
+            swap = manager.create_receive_invoice(100000, "default")
+            swap_id = swap.swap_id
+            mock_client.verify_swap.return_value = MOCK_ANKARA_VERIFY_PENDING
+
+            result = manager.get_swap_status(swap_id)
+
+            assert result["status"] == "pending"
+            assert result["amount"] == 100000
+            assert "swap_type" not in result  # receive path doesn't add swap_type
+
+    def test_routes_send_to_get_send_status(self, test_wallet, isolated_managers):
+        """Router dispatches send swap to get_send_status."""
+        manager = get_lightning_manager()
+        swap = LightningSwap(
+            swap_id="router_send_123",
+            swap_type="send",
+            provider="boltz",
+            invoice=VALID_INVOICE_MAINNET,
+            amount=50069,
+            wallet_name="default",
+            status="processing",
+            network="mainnet",
+            created_at=datetime.now(UTC).isoformat(),
+            lockup_txid="abc",
+            timeout_block_height=2500000,
+        )
+        isolated_managers.storage.save_lightning_swap(swap)
+
+        with patch("aqua.boltz.BoltzClient") as mock_boltz:
+            mock_client = MagicMock()
+            mock_boltz.return_value = mock_client
+            mock_client.get_swap_status.return_value = {"status": "transaction.confirmed"}
+
+            result = manager.get_swap_status("router_send_123")
+
+            assert result["swap_type"] == "send"
+            assert result["status"] == "processing"
+            assert result["provider_status"] == "transaction.confirmed"
+
+    def test_not_found_raises(self):
+        """Non-existent swap_id raises ValueError."""
+        manager = get_lightning_manager()
+
+        with pytest.raises(ValueError, match="not found"):
+            manager.get_swap_status("nonexistent_swap_id")
+
+
+class TestLightningTools:
+    """Tests for lightning_receive, lightning_send, lightning_transaction_status tools."""
+
+    def test_lightning_receive_tool(self, test_wallet):
+        """lightning_receive tool delegates to manager."""
+        with patch("aqua.tools.get_lightning_manager") as mock_get:
+            mock_manager = MagicMock()
+            mock_get.return_value = mock_manager
+            mock_manager.create_receive_invoice.return_value = LightningSwap(
+                swap_id="test_123",
+                swap_type="receive",
+                provider="ankara",
+                invoice=VALID_INVOICE_MAINNET,
+                amount=100000,
+                wallet_name="default",
+                status="pending",
+                network="mainnet",
+                created_at=datetime.now(UTC).isoformat(),
+                receive_address="lq1...",
+            )
+
+            result = lightning_receive(100000, "default")
+
+            assert result["swap_id"] == "test_123"
+            assert result["amount"] == 100000
+            assert "message" in result
+
+    def test_lightning_send_tool(self, test_wallet):
+        """lightning_send tool delegates to manager."""
+        with patch("aqua.tools.get_lightning_manager") as mock_get:
+            mock_manager = MagicMock()
+            mock_get.return_value = mock_manager
+            mock_manager.pay_invoice.return_value = LightningSwap(
+                swap_id="boltz_123",
+                swap_type="send",
+                provider="boltz",
+                invoice=VALID_INVOICE_MAINNET,
+                amount=50069,
+                wallet_name="default",
+                status="processing",
+                network="mainnet",
+                created_at=datetime.now(UTC).isoformat(),
+                lockup_txid="abc123",
+            )
+
+            result = lightning_send(VALID_INVOICE_MAINNET, "default")
+
+            assert result["swap_id"] == "boltz_123"
+            assert result["lockup_txid"] == "abc123"
+            assert result["status"] == "processing"
+
+    def test_lightning_send_tool_passes_amount_sats(self, test_wallet):
+        """lightning_send forwards amount_sats to manager.pay_invoice."""
+        with patch("aqua.tools.get_lightning_manager") as mock_get:
+            mock_manager = MagicMock()
+            mock_get.return_value = mock_manager
+            mock_manager.pay_invoice.return_value = LightningSwap(
+                swap_id="boltz_123",
+                swap_type="send",
+                provider="boltz",
+                invoice=VALID_INVOICE_MAINNET,
+                amount=50_000,
+                wallet_name="default",
+                status="processing",
+                network="mainnet",
+                created_at=datetime.now(UTC).isoformat(),
+                lockup_txid="abc123",
+            )
+
+            lightning_send(
+                "alice@getalby.com",
+                "default",
+                amount_sats=50_000,
+            )
+
+            mock_manager.pay_invoice.assert_called_once_with(
+                "alice@getalby.com",
+                "default",
+                password=None,
+                amount_sats=50_000,
+            )
+
+    def test_lightning_send_tool_ln_address_requires_amount_sats(self):
+        """lightning_send delegates LN-address-without-amount validation to the real manager."""
+        real_manager = get_lightning_manager()
+        with patch("aqua.tools.get_lightning_manager") as mock_get:
+            mock_manager = MagicMock(wraps=real_manager)
+            mock_get.return_value = mock_manager
+
+            with pytest.raises(
+                ValueError, match="amount_sats is required when paying a Lightning Address"
+            ):
+                lightning_send("alice@getalby.com", "default")
+
+            mock_manager.pay_invoice.assert_called_once_with(
+                "alice@getalby.com", "default", password=None, amount_sats=None
+            )
+
+    def test_lightning_send_tool_rejects_non_positive_amount_sats(self):
+        """Invalid amount_sats uses same ValueError style as lw_send."""
+        with patch("aqua.tools.get_lightning_manager") as mock_get:
+            with pytest.raises(ValueError, match="Amount must be positive"):
+                lightning_send(VALID_INVOICE_MAINNET, "default", amount_sats=0)
+
+            mock_get.assert_not_called()
+
+    def test_lightning_send_tool_rejects_non_int_amount_sats(self):
+        with patch("aqua.tools.get_lightning_manager") as mock_get:
+            with pytest.raises(ValueError, match="amount_sats must be a positive integer"):
+                lightning_send(
+                    VALID_INVOICE_MAINNET, "default", amount_sats=50_000.0
+                )
+
+            mock_get.assert_not_called()
+
+    def test_lightning_transaction_status_tool(self):
+        """lightning_transaction_status tool delegates to manager.get_swap_status."""
+        with patch("aqua.tools.get_lightning_manager") as mock_get:
+            mock_manager = MagicMock()
+            mock_get.return_value = mock_manager
+            mock_manager.get_swap_status.return_value = {
+                "swap_id": "test_123",
+                "status": "completed",
+                "amount": 100000,
+                "wallet_name": "default",
+                "invoice": VALID_INVOICE_MAINNET,
+            }
+
+            result = lightning_transaction_status("test_123")
+
+            assert result["status"] == "completed"
+            mock_manager.get_swap_status.assert_called_once_with("test_123")
+
+
+class TestLightningProviderSelection:
+    """pay_invoice honours the configured swap provider."""
+
+    def _balance(self, sats=200_000):
+        return [
+            Balance(
+                asset_id="policy_asset",
+                asset_name="L-BTC",
+                ticker="L-BTC",
+                amount=sats,
+            )
+        ]
+
+    def test_default_provider_is_indra(self, test_wallet, isolated_managers):
+        """With a factory config, the swap is created against Indra."""
+        manager = get_lightning_manager()
+        with patch.object(
+            type(get_manager()), "get_balance", return_value=self._balance()
+        ), patch(
+            "aqua.lightning.decode_bolt11_amount_sats", return_value=50_000
+        ), patch("aqua.indra.IndraClient") as mock_indra, patch(
+            "aqua.boltz.BoltzClient"
+        ) as mock_boltz, patch(
+            "aqua.lightning.generate_keypair", return_value=REFUND_KEYPAIR
+        ), patch("aqua.wallet.WalletManager.send", return_value="lockup_txid"):
+            mock_client = MagicMock()
+            mock_indra.return_value = mock_client
+            mock_client.get_submarine_pairs.return_value = MOCK_BOLTZ_SUBMARINE_PAIRS
+            mock_client.create_submarine_swap.return_value = MOCK_BOLTZ_SWAP_RESPONSE
+
+            swap = manager.pay_invoice(VALID_INVOICE_MAINNET, "default")
+
+            assert swap.provider == "indra"
+            mock_boltz.assert_not_called()
+            loaded = isolated_managers.storage.load_lightning_swap(swap.swap_id)
+            assert loaded.provider == "indra"
+
+    def test_config_selects_boltz(self, test_wallet, isolated_managers):
+        """lightning_provider="boltz" routes the swap through Boltz."""
+        from aqua.storage import Config
+
+        isolated_managers.storage.save_config(Config(lightning_provider="boltz"))
+        manager = get_lightning_manager()
+        with patch.object(
+            type(get_manager()), "get_balance", return_value=self._balance()
+        ), patch(
+            "aqua.lightning.decode_bolt11_amount_sats", return_value=50_000
+        ), patch("aqua.boltz.BoltzClient") as mock_boltz, patch(
+            "aqua.indra.IndraClient"
+        ) as mock_indra, patch(
+            "aqua.lightning.generate_keypair", return_value=REFUND_KEYPAIR
+        ), patch("aqua.wallet.WalletManager.send", return_value="lockup_txid"):
+            mock_client = MagicMock()
+            mock_boltz.return_value = mock_client
+            mock_client.get_submarine_pairs.return_value = MOCK_BOLTZ_SUBMARINE_PAIRS
+            mock_client.create_submarine_swap.return_value = MOCK_BOLTZ_SWAP_RESPONSE
+
+            swap = manager.pay_invoice(VALID_INVOICE_MAINNET, "default")
+
+            assert swap.provider == "boltz"
+            mock_indra.assert_not_called()
+
+    def test_env_var_overrides_config(self, test_wallet, isolated_managers, monkeypatch):
+        """AQUA_LIGHTNING_PROVIDER beats config.lightning_provider."""
+        from aqua.storage import Config
+
+        isolated_managers.storage.save_config(Config(lightning_provider="indra"))
+        monkeypatch.setenv("AQUA_LIGHTNING_PROVIDER", "boltz")
+        manager = get_lightning_manager()
+        with patch.object(
+            type(get_manager()), "get_balance", return_value=self._balance()
+        ), patch(
+            "aqua.lightning.decode_bolt11_amount_sats", return_value=50_000
+        ), patch("aqua.boltz.BoltzClient") as mock_boltz, patch(
+            "aqua.lightning.generate_keypair", return_value=REFUND_KEYPAIR
+        ), patch("aqua.wallet.WalletManager.send", return_value="lockup_txid"):
+            mock_client = MagicMock()
+            mock_boltz.return_value = mock_client
+            mock_client.get_submarine_pairs.return_value = MOCK_BOLTZ_SUBMARINE_PAIRS
+            mock_client.create_submarine_swap.return_value = MOCK_BOLTZ_SWAP_RESPONSE
+
+            swap = manager.pay_invoice(VALID_INVOICE_MAINNET, "default")
+
+            assert swap.provider == "boltz"
+
+    def test_unknown_provider_raises_before_any_call(self, test_wallet, isolated_managers):
+        """An invalid provider name fails loudly, with no HTTP call."""
+        from aqua.storage import Config
+
+        isolated_managers.storage.save_config(Config(lightning_provider="nostr"))
+        manager = get_lightning_manager()
+        with patch("aqua.indra.IndraClient") as mock_indra:
+            with pytest.raises(ValueError, match="Unknown Lightning swap provider"):
+                manager.pay_invoice(VALID_INVOICE_MAINNET, "default")
+            mock_indra.assert_not_called()
+
+    def test_amount_above_indra_max_rejected_before_http(self, test_wallet):
+        """100_001 sats passes Boltz's old ceiling but not Indra's."""
+        manager = get_lightning_manager()
+        with patch(
+            "aqua.lightning.decode_bolt11_amount_sats", return_value=100_001
+        ), patch("aqua.indra.IndraClient") as mock_indra:
+            with pytest.raises(ValueError, match="exceeds maximum"):
+                manager.pay_invoice(VALID_INVOICE_MAINNET, "default")
+            mock_indra.assert_not_called()
+
+    def test_live_pair_limits_reject_amount_inside_constants(self, test_wallet):
+        """The live pair's own limits are the authority, even inside the constants."""
+        manager = get_lightning_manager()
+        tight_pair = {
+            "L-BTC": {
+                "BTC": {
+                    "rate": 1.0,
+                    "fees": {"percentage": 0.1, "minerFees": 21},
+                    "limits": {"minimal": 1_000, "maximal": 20_000},
+                }
+            }
+        }
+        with patch.object(
+            type(get_manager()), "get_balance", return_value=self._balance()
+        ), patch(
+            "aqua.lightning.decode_bolt11_amount_sats", return_value=50_000
+        ), patch("aqua.indra.IndraClient") as mock_indra, patch(
+            "aqua.lightning.generate_keypair", return_value=REFUND_KEYPAIR
+        ):
+            mock_client = MagicMock()
+            mock_indra.return_value = mock_client
+            mock_client.get_submarine_pairs.return_value = tight_pair
+
+            with pytest.raises(ValueError, match="exceeds the current Indra"):
+                manager.pay_invoice(VALID_INVOICE_MAINNET, "default")
+
+            mock_client.create_submarine_swap.assert_not_called()
+
+    def test_live_pair_minimum_rejects_amount_inside_constants(self, test_wallet):
+        """Same guard on the low side."""
+        manager = get_lightning_manager()
+        tight_pair = {
+            "L-BTC": {
+                "BTC": {
+                    "limits": {"minimal": 5_000, "maximal": 100_000},
+                }
+            }
+        }
+        with patch.object(
+            type(get_manager()), "get_balance", return_value=self._balance()
+        ), patch(
+            "aqua.lightning.decode_bolt11_amount_sats", return_value=2_000
+        ), patch("aqua.indra.IndraClient") as mock_indra, patch(
+            "aqua.lightning.generate_keypair", return_value=REFUND_KEYPAIR
+        ):
+            mock_client = MagicMock()
+            mock_indra.return_value = mock_client
+            mock_client.get_submarine_pairs.return_value = tight_pair
+
+            with pytest.raises(ValueError, match="below the current Indra"):
+                manager.pay_invoice(VALID_INVOICE_MAINNET, "default")
+
+            mock_client.create_submarine_swap.assert_not_called()
+
+
+class TestSendSwapVerification:
+    """pay_invoice must verify the provider's swap before funding it."""
+
+    def _pay(self, test_wallet, swap_resp, pairs=MOCK_BOLTZ_SUBMARINE_PAIRS):
+        balance = [
+            Balance(asset_id="p", asset_name="L-BTC", ticker="L-BTC", amount=200_000)
+        ]
+        manager = get_lightning_manager()
+        with patch.object(
+            type(get_manager()), "get_balance", return_value=balance
+        ), patch(
+            "aqua.lightning.decode_bolt11_amount_sats", return_value=50_000
+        ), patch("aqua.indra.IndraClient") as mock_indra, patch(
+            "aqua.lightning.generate_keypair", return_value=REFUND_KEYPAIR
+        ), patch(
+            "aqua.wallet.WalletManager.send", return_value="lockup_txid"
+        ) as mock_send:
+            client = MagicMock()
+            mock_indra.return_value = client
+            client.get_submarine_pairs.return_value = pairs
+            client.create_submarine_swap.return_value = swap_resp
+            try:
+                manager.pay_invoice(VALID_INVOICE_MAINNET, "default")
+            finally:
+                self.send = mock_send
+                self.client = client
+
+    def test_honest_swap_is_funded_once(self, test_wallet):
+        self._pay(test_wallet, MOCK_BOLTZ_SWAP_RESPONSE)
+        self.send.assert_called_once_with(
+            "default",
+            MOCK_BOLTZ_SWAP_RESPONSE["address"],
+            50069,
+            password=None,
+        )
+
+    def test_hostile_address_is_refused(self, test_wallet):
+        other = _lockup_address(
+            refund_pubkey=PrivateKey(bytes.fromhex("44" * 32)).public_key.format().hex()
+        )
+        resp = {**MOCK_BOLTZ_SWAP_RESPONSE, "address": other}
+        with pytest.raises(ValueError, match="not funded.*does not match"):
+            self._pay(test_wallet, resp)
+        self.send.assert_not_called()
+
+    def test_wrong_blinding_key_is_refused(self, test_wallet):
+        resp = {**MOCK_BOLTZ_SWAP_RESPONSE, "blindingKey": "55" * 32}
+        with pytest.raises(ValueError, match="blindingKey does not match"):
+            self._pay(test_wallet, resp)
+        self.send.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("claimPublicKey", "zz"),
+            ("claimPublicKey", "03" + "ab" * 10),
+            ("timeoutBlockHeight", "2500000"),
+            ("address", "not-an-address"),
+        ],
+    )
+    def test_malformed_fields_are_refused(self, test_wallet, field, value):
+        resp = {**MOCK_BOLTZ_SWAP_RESPONSE, field: value}
+        with pytest.raises(ValueError, match="not funded"):
+            self._pay(test_wallet, resp)
+        self.send.assert_not_called()
+
+    def test_missing_field_is_refused(self, test_wallet):
+        resp = {k: v for k, v in MOCK_BOLTZ_SWAP_RESPONSE.items() if k != "address"}
+        with pytest.raises(ValueError, match="not funded"):
+            self._pay(test_wallet, resp)
+        self.send.assert_not_called()
+
+    def test_amount_at_cap_passes_and_above_is_refused(self, test_wallet):
+        # cap = 50000 + ceil(50000 * 0.1 / 100) + 19
+        self._pay(test_wallet, {**MOCK_BOLTZ_SWAP_RESPONSE, "expectedAmount": 50069})
+        self.send.assert_called_once()
+        with pytest.raises(ValueError, match="exceeds the quoted maximum 50069"):
+            self._pay(
+                test_wallet, {**MOCK_BOLTZ_SWAP_RESPONSE, "expectedAmount": 50070}
+            )
+        self.send.assert_not_called()
+
+    def test_amount_at_invoice_passes_and_below_is_refused(self, test_wallet):
+        self._pay(test_wallet, {**MOCK_BOLTZ_SWAP_RESPONSE, "expectedAmount": 50_000})
+        self.send.assert_called_once()
+        with pytest.raises(ValueError, match="below the invoice amount 50000"):
+            self._pay(test_wallet, {**MOCK_BOLTZ_SWAP_RESPONSE, "expectedAmount": 1})
+        self.send.assert_not_called()
+
+    @pytest.mark.parametrize("amount", ["50069", 50069.0, True, None])
+    def test_non_integer_amount_is_refused(self, test_wallet, amount):
+        with pytest.raises(ValueError, match="not funded"):
+            self._pay(
+                test_wallet, {**MOCK_BOLTZ_SWAP_RESPONSE, "expectedAmount": amount}
+            )
+        self.send.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "fees",
+        [None, {}, {"percentage": 0.1}, {"minerFees": 19}, {"percentage": "x", "minerFees": 19}],
+    )
+    def test_unusable_pair_fees_are_refused(self, test_wallet, fees):
+        base = MOCK_BOLTZ_SUBMARINE_PAIRS["L-BTC"]["BTC"]
+        pair = {k: v for k, v in base.items() if k != "fees"}
+        if fees is not None:
+            pair["fees"] = fees
+        pairs = {"L-BTC": {"BTC": pair}}
+        with pytest.raises(ValueError, match="cannot bound expectedAmount"):
+            self._pay(test_wallet, MOCK_BOLTZ_SWAP_RESPONSE, pairs)
+        self.send.assert_not_called()
+        self.client.create_submarine_swap.assert_not_called()
+
+
+    @pytest.mark.parametrize(
+        "timeout",
+        [
+            TIMEOUT_HEIGHT - 1_000 + MAX_SWAP_TIMEOUT_DELTA_BLOCKS + 1,
+            TIMEOUT_HEIGHT - 1_000,
+            TIMEOUT_HEIGHT - 1_001,
+            500_000_000,
+            2**32,
+        ],
+    )
+    def test_timeout_outside_window_is_refused(self, test_wallet, timeout):
+        with pytest.raises(ValueError, match="outside the accepted window"):
+            self._pay(test_wallet, {**MOCK_BOLTZ_SWAP_RESPONSE, "timeoutBlockHeight": timeout})
+        self.send.assert_not_called()
+
+    def test_timeout_at_window_edge_passes(self, test_wallet, chain_tip):
+        chain_tip.return_value = TIMEOUT_HEIGHT - MAX_SWAP_TIMEOUT_DELTA_BLOCKS
+        self._pay(test_wallet, MOCK_BOLTZ_SWAP_RESPONSE)
+        self.send.assert_called_once()
+
+    def test_tip_fetch_failure_is_refused(self, test_wallet, chain_tip):
+        chain_tip.side_effect = RuntimeError("esplora down")
+        with pytest.raises(ValueError, match="Cannot fetch the Liquid chain tip"):
+            self._pay(test_wallet, MOCK_BOLTZ_SWAP_RESPONSE)
+        self.send.assert_not_called()
+        self.client.create_submarine_swap.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "fees,match",
+        [
+            ({"percentage": 0.51, "minerFees": 19}, "0.5% ceiling"),
+            ({"percentage": 0.1, "minerFees": 1_001}, "1000 sats ceiling"),
+        ],
+    )
+    def test_fees_above_fixed_ceiling_are_refused(self, test_wallet, fees, match):
+        base = MOCK_BOLTZ_SUBMARINE_PAIRS["L-BTC"]["BTC"]
+        pairs = {"L-BTC": {"BTC": {**base, "fees": fees}}}
+        resp = {**MOCK_BOLTZ_SWAP_RESPONSE, "expectedAmount": 50_000}
+        with pytest.raises(ValueError, match=match):
+            self._pay(test_wallet, resp, pairs)
+        self.send.assert_not_called()
+        self.client.create_submarine_swap.assert_not_called()
+
+    def test_fees_exactly_at_ceilings_pass(self, test_wallet):
+        base = MOCK_BOLTZ_SUBMARINE_PAIRS["L-BTC"]["BTC"]
+        fees = {"percentage": 0.5, "minerFees": 1_000}
+        pairs = {"L-BTC": {"BTC": {**base, "fees": fees}}}
+        # cap = 50000 + ceil(50000 * 0.5 / 100) + 1000
+        resp = {**MOCK_BOLTZ_SWAP_RESPONSE, "expectedAmount": 51_250}
+        self._pay(test_wallet, resp, pairs)
+        self.send.assert_called_once()
+
+
+class TestSwapStatusMapping:
+    """Indra's status enum maps onto the local lifecycle statuses."""
+
+    def _stored_swap(self, storage, swap_id, provider="indra"):
+        swap = LightningSwap(
+            swap_id=swap_id,
+            swap_type="send",
+            provider=provider,
+            invoice=VALID_INVOICE_MAINNET,
+            amount=1_021,
+            wallet_name="default",
+            status="processing",
+            network="mainnet",
+            created_at=datetime.now(UTC).isoformat(),
+            lockup_txid="lockup_abc",
+            timeout_block_height=2_500_000,
+        )
+        storage.save_lightning_swap(swap)
+        return swap
+
+    @pytest.mark.parametrize(
+        "remote_status,expected",
+        [
+            ("invoice.set", "processing"),
+            ("invoice.pending", "processing"),
+            ("invoice.paid", "completed"),
+            ("invoice.settled", "completed"),
+            ("invoice.expired", "failed"),
+            ("invoice.failedToPay", "failed"),
+            ("transaction.lockupFailed", "failed"),
+        ],
+    )
+    def test_indra_statuses_map(
+        self, test_wallet, isolated_managers, remote_status, expected
+    ):
+        manager = get_lightning_manager()
+        swap_id = f"indra_{remote_status.replace('.', '_')}"
+        self._stored_swap(isolated_managers.storage, swap_id)
+
+        with patch("aqua.indra.IndraClient") as mock_indra:
+            mock_client = MagicMock()
+            mock_indra.return_value = mock_client
+            mock_client.get_swap_status.return_value = {"status": remote_status}
+            mock_client.get_claim_details.return_value = {"preimage": "cc" * 32}
+
+            result = manager.get_send_status(swap_id)
+
+            assert result["status"] == expected
+            assert result["provider_status"] == remote_status
+            assert result["provider"] == "indra"
+
+    def test_invoice_paid_pulls_the_preimage(self, test_wallet, isolated_managers):
+        """A completed Indra swap surfaces proof of payment."""
+        manager = get_lightning_manager()
+        self._stored_swap(isolated_managers.storage, "indra_paid")
+
+        with patch("aqua.indra.IndraClient") as mock_indra:
+            mock_client = MagicMock()
+            mock_indra.return_value = mock_client
+            mock_client.get_swap_status.return_value = {"status": "invoice.paid"}
+            mock_client.get_claim_details.return_value = {
+                "preimage": "dd" * 32,
+                "claimTxid": "claim_hex",
+            }
+
+            result = manager.get_send_status("indra_paid")
+
+            assert result["preimage"] == "dd" * 32
+            assert result["claim_txid"] == "claim_hex"
+
+    def test_old_boltz_swap_still_queries_boltz(self, test_wallet, isolated_managers):
+        """A swap persisted before the switch keeps resolving against Boltz."""
+        manager = get_lightning_manager()
+        self._stored_swap(isolated_managers.storage, "legacy_boltz", provider="boltz")
+
+        with patch("aqua.boltz.BoltzClient") as mock_boltz, patch(
+            "aqua.indra.IndraClient"
+        ) as mock_indra:
+            mock_client = MagicMock()
+            mock_boltz.return_value = mock_client
+            mock_client.get_swap_status.return_value = {"status": "transaction.mempool"}
+
+            result = manager.get_send_status("legacy_boltz")
+
+            assert result["provider"] == "boltz"
+            assert result["provider_status"] == "transaction.mempool"
+            mock_indra.assert_not_called()
+
+    def test_unknown_stored_provider_warns_instead_of_guessing(
+        self, test_wallet, isolated_managers
+    ):
+        """An unrecognised provider name never falls back to another service."""
+        manager = get_lightning_manager()
+        self._stored_swap(isolated_managers.storage, "weird", provider="atlantis")
+
+        with patch("aqua.indra.IndraClient") as mock_indra, patch(
+            "aqua.boltz.BoltzClient"
+        ) as mock_boltz:
+            result = manager.get_send_status("weird")
+
+            assert "warning" in result
+            assert "atlantis" in result["warning"]
+            assert "provider_status" not in result
+            mock_indra.assert_not_called()
+            mock_boltz.assert_not_called()
+
+
+class TestRefundFieldPersistence:
+    """A failed swap can only be refunded from data captured at creation time."""
+
+    @patch("aqua.lightning.generate_keypair")
+    @patch("aqua.lightning.decode_bolt11_amount_sats")
+    @patch("aqua.indra.IndraClient")
+    @patch("aqua.wallet.WalletManager.send")
+    @patch("aqua.wallet.WalletManager.get_balance")
+    def test_pay_invoice_stores_refund_material(
+        self, mock_balance, mock_send, mock_indra, mock_decode, mock_keypair, test_wallet
+    ):
+        mock_decode.return_value = 50000
+        mock_keypair.return_value = REFUND_KEYPAIR
+        mock_balance.return_value = [
+            Balance(
+                asset_id="policy_asset",
+                asset_name="L-BTC",
+                ticker="L-BTC",
+                amount=100000,
+            )
+        ]
+        mock_send.return_value = "lockup_txid_abc"
+        client = MagicMock()
+        client.get_submarine_pairs.return_value = MOCK_BOLTZ_SUBMARINE_PAIRS
+        client.create_submarine_swap.return_value = MOCK_BOLTZ_SWAP_RESPONSE
+        mock_indra.return_value = client
+
+        manager = get_lightning_manager()
+        swap = manager.pay_invoice(VALID_INVOICE_MAINNET, "default")
+
+        assert swap.claim_public_key == MOCK_BOLTZ_SWAP_RESPONSE["claimPublicKey"]
+        assert swap.lockup_address == MOCK_BOLTZ_SWAP_RESPONSE["address"]
+        assert swap.swap_tree == MOCK_BOLTZ_SWAP_RESPONSE["swapTree"]
+        assert swap.refund_txid is None
+
+        reloaded = manager.storage.load_lightning_swap(swap.swap_id)
+        assert reloaded.claim_public_key == swap.claim_public_key
+        assert reloaded.lockup_address == swap.lockup_address
+
+    @patch("aqua.lightning.generate_keypair")
+    @patch("aqua.lightning.decode_bolt11_amount_sats")
+    @patch("aqua.indra.IndraClient")
+    @patch("aqua.wallet.WalletManager.send")
+    @patch("aqua.wallet.WalletManager.get_balance")
+    def test_pay_invoice_refuses_a_swap_without_blinding_key(
+        self, mock_balance, mock_send, mock_indra, mock_decode, mock_keypair, test_wallet
+    ):
+        """No blindingKey means no refund; the lockup must not be funded."""
+        mock_decode.return_value = 50000
+        mock_keypair.return_value = REFUND_KEYPAIR
+        mock_balance.return_value = [
+            Balance(asset_id="policy_asset", asset_name="L-BTC", ticker="L-BTC", amount=100000)
+        ]
+        client = MagicMock()
+        client.get_submarine_pairs.return_value = MOCK_BOLTZ_SUBMARINE_PAIRS
+        client.create_submarine_swap.return_value = {
+            k: v for k, v in MOCK_BOLTZ_SWAP_RESPONSE.items() if k != "blindingKey"
+        }
+        mock_indra.return_value = client
+
+        with pytest.raises(ValueError, match="blindingKey"):
+            get_lightning_manager().pay_invoice(VALID_INVOICE_MAINNET, "default")
+
+        mock_send.assert_not_called()
+
+    def test_from_dict_accepts_records_without_refund_fields(self):
+        """Swaps written before these fields existed must still load."""
+        swap = LightningSwap.from_dict({
+            "swap_id": "legacy_1",
+            "swap_type": "send",
+            "provider": "indra",
+            "invoice": "lnbc...",
+            "amount": 1022,
+            "wallet_name": "default",
+            "status": "failed",
+            "network": "mainnet",
+            "created_at": "2026-03-12T00:00:00+00:00",
+            "refund_private_key": "aa" * 32,
+            "timeout_block_height": 4113159,
+        })
+        assert swap.claim_public_key is None
+        assert swap.blinding_key is None
+        assert swap.refund_txid is None
+
+
+def _failed_send_swap(**overrides) -> LightningSwap:
+    fields = {
+        "swap_id": "swap_failed_1",
+        "swap_type": "send",
+        "provider": "indra",
+        "invoice": "lnbc10u1ptest",
+        "amount": 1022,
+        "wallet_name": "default",
+        "status": "failed",
+        "network": "mainnet",
+        "created_at": "2026-03-12T00:00:00+00:00",
+        "lockup_txid": "lockup_abc",
+        "refund_private_key": "aa" * 32,
+        "timeout_block_height": 4113159,
+        "claim_public_key": "03" + "ab" * 32,
+        "blinding_key": "cc" * 32,
+        "lockup_address": "lq1qqlockup",
+    }
+    fields.update(overrides)
+    return LightningSwap(**fields)
+
+
+class TestRefundSendSwap:
+    """Guards around refunding; the crypto itself is covered by test_boltz_refund."""
+
+    def _manager_with(self, swap):
+        manager = get_lightning_manager()
+        manager.storage.save_lightning_swap(swap)
+        return manager
+
+    def _provider_client(self, status="invoice.failedToPay"):
+        client = MagicMock()
+        client.get_swap_status.return_value = {
+            "status": status,
+            "transaction": {"hex": "deadbeef"},
+        }
+        return client
+
+    @patch("aqua.lightning.refund_submarine_swap")
+    @patch("aqua.lightning.decode_bolt11_payment_hash")
+    @patch("aqua.indra.IndraClient")
+    @patch("aqua.wallet.WalletManager.get_block_height")
+    @patch("aqua.wallet.WalletManager.get_address")
+    def test_broadcasts_and_records_the_refund(
+        self, mock_address, mock_tip, mock_indra, mock_hash, mock_refund, test_wallet
+    ):
+        mock_hash.return_value = "11" * 32
+        mock_tip.return_value = 4_063_000
+        mock_address.return_value = MagicMock(address="lq1qqdestination")
+        mock_indra.return_value = self._provider_client()
+        mock_refund.return_value = {
+            "swap_id": "swap_failed_1",
+            "refund_type": "cooperative",
+            "amount": 1003,
+            "fee": 19,
+            "destination_address": "lq1qqdestination",
+            "network": "mainnet",
+            "refund_txid": "refund_txid_xyz",
+        }
+        manager = self._manager_with(_failed_send_swap())
+
+        result = manager.refund_send_swap("swap_failed_1")
+
+        assert result["refund_txid"] == "refund_txid_xyz"
+        assert result["status"] == "refunded"
+        assert result["wallet_name"] == "default"
+        stored = manager.storage.load_lightning_swap("swap_failed_1")
+        assert stored.refund_txid == "refund_txid_xyz"
+        assert stored.status == "refunded"
+
+    @patch("aqua.lightning.refund_submarine_swap")
+    @patch("aqua.lightning.decode_bolt11_payment_hash")
+    @patch("aqua.indra.IndraClient")
+    @patch("aqua.wallet.WalletManager.get_block_height")
+    @patch("aqua.wallet.WalletManager.get_address")
+    def test_dry_run_leaves_the_record_untouched(
+        self, mock_address, mock_tip, mock_indra, mock_hash, mock_refund, test_wallet
+    ):
+        mock_hash.return_value = "11" * 32
+        mock_tip.return_value = 4_063_000
+        mock_address.return_value = MagicMock(address="lq1qqdestination")
+        mock_indra.return_value = self._provider_client()
+        mock_refund.return_value = {
+            "swap_id": "swap_failed_1",
+            "refund_type": "cooperative",
+            "amount": 1003,
+            "fee": 19,
+            "destination_address": "lq1qqdestination",
+            "network": "mainnet",
+            "dry_run": True,
+            "tx_hex": "0200beef",
+        }
+        manager = self._manager_with(_failed_send_swap())
+
+        result = manager.refund_send_swap("swap_failed_1", dry_run=True)
+
+        assert result["tx_hex"] == "0200beef"
+        assert "refund_txid" not in result
+        stored = manager.storage.load_lightning_swap("swap_failed_1")
+        assert stored.refund_txid is None
+        assert stored.status == "failed"
+
+    @patch("aqua.lightning.refund_submarine_swap")
+    @patch("aqua.lightning.decode_bolt11_payment_hash")
+    @patch("aqua.indra.IndraClient")
+    @patch("aqua.wallet.WalletManager.get_block_height")
+    @patch("aqua.wallet.WalletManager.get_address")
+    def test_legacy_overrides_reach_the_crypto_layer(
+        self, mock_address, mock_tip, mock_indra, mock_hash, mock_refund, test_wallet
+    ):
+        mock_hash.return_value = "11" * 32
+        mock_tip.return_value = 4_063_000
+        mock_address.return_value = MagicMock(address="lq1qqdestination")
+        mock_indra.return_value = self._provider_client()
+        mock_refund.return_value = {
+            "swap_id": "swap_failed_1",
+            "refund_type": "cooperative",
+            "amount": 1003,
+            "fee": 19,
+            "destination_address": "lq1qqdestination",
+            "network": "mainnet",
+            "refund_txid": "refund_txid_xyz",
+        }
+        manager = self._manager_with(
+            _failed_send_swap(claim_public_key=None, blinding_key=None)
+        )
+
+        manager.refund_send_swap(
+            "swap_failed_1",
+            claim_public_key="03" + "ef" * 32,
+            blinding_key="dd" * 32,
+        )
+
+        kwargs = mock_refund.call_args.kwargs
+        assert kwargs["claim_public_key"] == "03" + "ef" * 32
+        assert kwargs["blinding_key"] == "dd" * 32
+
+    def test_unknown_swap(self, test_wallet):
+        with pytest.raises(ValueError, match="not found"):
+            get_lightning_manager().refund_send_swap("nope")
+
+    def test_receive_swap_rejected(self, test_wallet):
+        swap = _failed_send_swap(swap_type="receive", provider="ankara")
+        manager = self._manager_with(swap)
+        with pytest.raises(ValueError, match="receive swap"):
+            manager.refund_send_swap("swap_failed_1")
+
+    def test_already_refunded(self, test_wallet):
+        manager = self._manager_with(_failed_send_swap(refund_txid="already_done"))
+        with pytest.raises(ValueError, match="already refunded"):
+            manager.refund_send_swap("swap_failed_1")
+
+    @patch("aqua.indra.IndraClient")
+    def test_unfunded_swap_has_nothing_to_refund(self, mock_indra, test_wallet):
+        client = MagicMock()
+        client.get_swap_status.return_value = {"status": "swap.expired"}
+        mock_indra.return_value = client
+        manager = self._manager_with(_failed_send_swap(lockup_txid=None))
+        with pytest.raises(ValueError, match="never funded"):
+            manager.refund_send_swap("swap_failed_1")
+
+    @patch("aqua.lightning.refund_submarine_swap")
+    @patch("aqua.lightning.decode_bolt11_payment_hash")
+    @patch("aqua.indra.IndraClient")
+    @patch("aqua.wallet.WalletManager.get_block_height")
+    @patch("aqua.wallet.WalletManager.get_address")
+    def test_lockup_lost_locally_is_recovered_from_the_provider(
+        self, mock_address, mock_tip, mock_indra, mock_hash, mock_refund, test_wallet
+    ):
+        """pay_invoice may die after broadcasting but before saving lockup_txid."""
+        mock_hash.return_value = "11" * 32
+        mock_tip.return_value = 4_063_000
+        mock_address.return_value = MagicMock(address="lq1qqdestination")
+        client = MagicMock()
+        client.get_swap_status.return_value = {
+            "status": "invoice.failedToPay",
+            "transaction": {"id": "lockup_from_provider", "hex": "deadbeef"},
+        }
+        mock_indra.return_value = client
+        mock_refund.return_value = {
+            "swap_id": "swap_failed_1",
+            "refund_type": "cooperative",
+            "amount": 1003,
+            "fee": 19,
+            "destination_address": "lq1qqdestination",
+            "network": "mainnet",
+            "refund_txid": "refund_txid_xyz",
+        }
+        manager = self._manager_with(_failed_send_swap(lockup_txid=None, status="pending"))
+
+        result = manager.refund_send_swap("swap_failed_1")
+
+        assert result["refund_txid"] == "refund_txid_xyz"
+        assert mock_refund.call_args.kwargs["lockup_tx_hex"] == "deadbeef"
+        stored = manager.storage.load_lightning_swap("swap_failed_1")
+        assert stored.lockup_txid == "lockup_from_provider"
+        assert stored.status == "refunded"
+
+    def test_legacy_swap_without_keys_explains_the_override(self, test_wallet):
+        manager = self._manager_with(
+            _failed_send_swap(claim_public_key=None, blinding_key=None)
+        )
+        with pytest.raises(ValueError, match="--claim-public-key"):
+            manager.refund_send_swap("swap_failed_1")
+
+    @patch("aqua.indra.IndraClient")
+    def test_completed_swap_is_not_refundable(self, mock_indra, test_wallet):
+        mock_indra.return_value = self._provider_client(status="transaction.claimed")
+        manager = self._manager_with(_failed_send_swap())
+        with pytest.raises(ValueError, match="only failed swaps"):
+            manager.refund_send_swap("swap_failed_1")
+
+    @patch("aqua.indra.IndraClient")
+    def test_externally_refunded_swap_is_reported(self, mock_indra, test_wallet):
+        mock_indra.return_value = self._provider_client(status="transaction.refunded")
+        manager = self._manager_with(_failed_send_swap())
+        with pytest.raises(ValueError, match="already spent"):
+            manager.refund_send_swap("swap_failed_1")
+
+    @patch("aqua.indra.IndraClient")
+    def test_network_failure_is_not_swallowed(self, mock_indra, test_wallet):
+        client = MagicMock()
+        client.get_swap_status.side_effect = RuntimeError("Indra API unreachable")
+        mock_indra.return_value = client
+        manager = self._manager_with(_failed_send_swap())
+        with pytest.raises(RuntimeError, match="unreachable"):
+            manager.refund_send_swap("swap_failed_1")
+
+
+class TestRefundInfoInStatus:
+    @patch("aqua.indra.IndraClient")
+    def test_failed_swap_is_marked_refundable(self, mock_indra, test_wallet):
+        client = MagicMock()
+        client.get_swap_status.return_value = {"status": "invoice.failedToPay"}
+        mock_indra.return_value = client
+        manager = get_lightning_manager()
+        manager.storage.save_lightning_swap(_failed_send_swap())
+
+        result = manager.get_send_status("swap_failed_1")
+
+        assert result["refund_info"]["refundable"] is True
+        assert result["refund_info"]["timeout_block_height"] == 4113159
+        assert result["refund_info"]["lockup_address"] == "lq1qqlockup"
+
+    @patch("aqua.indra.IndraClient")
+    def test_refunded_swap_reports_its_txid_and_is_not_refundable(
+        self, mock_indra, test_wallet
+    ):
+        client = MagicMock()
+        client.get_swap_status.return_value = {"status": "transaction.refunded"}
+        mock_indra.return_value = client
+        manager = get_lightning_manager()
+        manager.storage.save_lightning_swap(
+            _failed_send_swap(status="refunded", refund_txid="refund_txid_xyz")
+        )
+
+        result = manager.get_send_status("swap_failed_1")
+
+        assert result["status"] == "refunded"
+        assert result["refund_info"]["refundable"] is False
+        assert result["refund_info"]["refund_txid"] == "refund_txid_xyz"
+
+    @patch("aqua.indra.IndraClient")
+    def test_stale_provider_status_does_not_undo_a_refund(self, mock_indra, test_wallet):
+        """Providers keep reporting the failure long after the refund is on chain."""
+        client = MagicMock()
+        client.get_swap_status.return_value = {"status": "invoice.failedToPay"}
+        mock_indra.return_value = client
+        manager = get_lightning_manager()
+        manager.storage.save_lightning_swap(
+            _failed_send_swap(status="refunded", refund_txid="refund_txid_xyz")
+        )
+
+        result = manager.get_send_status("swap_failed_1")
+
+        assert result["status"] == "refunded"
+        assert manager.storage.load_lightning_swap("swap_failed_1").status == "refunded"

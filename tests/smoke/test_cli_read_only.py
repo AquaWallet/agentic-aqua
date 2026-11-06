@@ -1,0 +1,349 @@
+"""CLI smoke tests: read-only operations against MAINNET.
+
+These tests hit MAINNET via real Electrum/Esplora servers.
+By default they use a throwaway BIP39 mnemonic with no on-chain history;
+override with SIGNER_MNEMONIC to run against a wallet with real history.
+
+Usage:
+    uv run python -m pytest tests/smoke/ -v
+"""
+
+import json
+import os
+import time
+
+import pytest
+from click.testing import CliRunner
+
+from aqua.cli.main import cli
+
+DEFAULT_MNEMONIC = "tuna tuna tuna tuna tuna tuna tuna tuna tuna tuna tuna twelve"
+SIGNER_MNEMONIC = os.getenv("SIGNER_MNEMONIC", DEFAULT_MNEMONIC)
+CT_DESCRIPTOR_LIQUID = os.getenv("CT_DESCRIPTOR_LIQUID")
+BTC_DESCRIPTOR = os.getenv("BTC_DESCRIPTOR")
+
+
+@pytest.fixture(scope="module")
+def wallet_name():
+    """Unique wallet name for this smoke run."""
+    return f"smoke_cli_{int(time.time())}"
+
+
+# Esplora/Electrum: connection resets, timeouts, Windows WSAETIMEDOUT (10060), minreq
+# LWK wraps all Electrum retry failures as AllAttemptsErrored (empty server response = EOF)
+TRANSIENT_NETWORK_MARKERS = (
+    "minreq",
+    "connection reset",
+    "timed out",
+    "timeout",
+    "10060",
+    "connection attempt failed",
+    "failed to respond",
+    "established connection failed",
+    "allattemptserrored",
+)
+
+
+_SMOKE_CLI_ATTEMPTS = 6
+_SMOKE_CLI_RETRY_DELAY_S = 3
+
+# Mainnet Esplora scans for `btc transactions` and `unified balance` routinely
+# take 50–120s each (BDK scans every derived address). Run them locally but
+# skip on GitHub Actions to keep CI under the wall-clock budget.
+_SKIP_ON_CI = pytest.mark.skipif(
+    os.getenv("GITHUB_ACTIONS") == "true",
+    reason="slow Esplora scan (50–120s); runs locally, skipped on CI",
+)
+
+# TEMPORARY — Boltz outage. Boltz is the swap provider behind Ankara, so
+# `lightning receive` fails with `500 POST /api/v1/lightning/swaps/create/`.
+# That is an upstream outage, not a regression in this repo, so the Lightning
+# smoke tests are skipped by default rather than reported as failures.
+# Run them anyway with AQUA_SMOKE_LIGHTNING=1, and delete this marker (plus its
+# two usages below) once Boltz is back up.
+_SKIP_LIGHTNING_OUTAGE = pytest.mark.skipif(
+    os.getenv("AQUA_SMOKE_LIGHTNING") != "1",
+    reason="Boltz is down: Ankara swap creation returns 500. "
+           "Set AQUA_SMOKE_LIGHTNING=1 to run these anyway.",
+)
+
+
+@pytest.fixture(scope="module")
+def cli_runner():
+    """Return a function that invokes aqua-cli and returns parsed JSON.
+
+    Retries on transient Esplora/Electrum network errors so smoke tests are
+    not brittle against occasional upstream connection resets.
+    If the upstream stays unreachable, skips the test instead of hard-failing CI.
+    """
+    runner = CliRunner()
+
+    def run(*args):
+        last_output = ""
+        result = None
+        for attempt in range(_SMOKE_CLI_ATTEMPTS):
+            result = runner.invoke(cli, ["--format", "json", *args])
+            if result.exit_code == 0:
+                return json.loads(result.stdout)
+            last_output = f"{result.stdout!r} {result.stderr!r}"
+            if not any(m in last_output.lower() for m in TRANSIENT_NETWORK_MARKERS):
+                break
+            if attempt < _SMOKE_CLI_ATTEMPTS - 1:
+                time.sleep(_SMOKE_CLI_RETRY_DELAY_S)
+
+        if result is not None and result.exit_code != 0 and any(
+            m in last_output.lower() for m in TRANSIENT_NETWORK_MARKERS
+        ):
+            pytest.skip(
+                "Network error after retries (mainnet API unreachable). "
+                f"Last output: {last_output[:400]}"
+            )
+        raise AssertionError(f"CLI failed: {last_output}")
+
+    return run
+
+
+class TestSmokeImportWallet:
+	def test_import_wallet(self, wallet_name):
+		"""Import the test wallet from SIGNER_MNEMONIC."""
+		runner = CliRunner()
+		result = runner.invoke(
+			cli,
+			["--format", "json", "wallet", "import-mnemonic",
+			 "--mnemonic-stdin", "--wallet-name", wallet_name],
+			input=SIGNER_MNEMONIC + "\n",
+		)
+		assert result.exit_code == 0
+		data = json.loads(result.stdout)
+		assert data["wallet_name"] == wallet_name
+		assert data["watch_only"] is False
+
+
+class TestSmokeAddresses:
+    def test_liquid_address(self, cli_runner, wallet_name):
+        """Liquid address starts with lq1 (mainnet)."""
+        result = cli_runner("liquid", "address", "--wallet-name", wallet_name)
+        assert result["address"].startswith("lq1") or result["address"].startswith("ex1")
+
+    def test_btc_address(self, cli_runner, wallet_name):
+        """Bitcoin address starts with bc1 (mainnet)."""
+        result = cli_runner("btc", "address", "--wallet-name", wallet_name)
+        assert result["address"].startswith("bc1")
+
+
+class TestSmokeBalance:
+    @_SKIP_ON_CI
+    def test_unified_balance(self, cli_runner, wallet_name):
+        """Unified balance returns both networks."""
+        result = cli_runner("balance", "--wallet-name", wallet_name)
+        assert "liquid" in result
+        assert "bitcoin" in result or "bitcoin_error" in result
+
+
+class TestSmokeBtcTransactions:
+    @_SKIP_ON_CI
+    def test_btc_transactions(self, cli_runner, wallet_name):
+        """BTC transactions returns a list."""
+        result = cli_runner("btc", "transactions", "--wallet-name", wallet_name)
+        assert "transactions" in result
+        assert isinstance(result["transactions"], list)
+
+
+class TestSmokeLiquidTransactions:
+    def test_liquid_transactions(self, cli_runner, wallet_name):
+        """Liquid transactions returns a list."""
+        result = cli_runner("liquid", "transactions", "--wallet-name", wallet_name)
+        assert "transactions" in result
+        assert isinstance(result["transactions"], list)
+
+
+class TestSmokeListWallets:
+    def test_list_wallets(self, cli_runner, wallet_name):
+        """Wallet list includes the smoke wallet."""
+        result = cli_runner("wallet", "list")
+        assert result["count"] >= 1
+        wallet_names = [w["name"] if isinstance(w, dict) else w for w in result["wallets"]]
+        assert wallet_name in wallet_names
+
+
+class TestSmokeExportDescriptor:
+    def test_export_descriptor(self, cli_runner, wallet_name):
+        """Export descriptor returns a CT descriptor string."""
+        result = cli_runner("liquid", "export-descriptor", "--wallet-name", wallet_name)
+        assert "descriptor" in result
+        assert result["descriptor"].startswith("ct(")
+
+
+class TestSmokeExportBtcDescriptor:
+    def test_export_btc_descriptor(self, cli_runner, wallet_name):
+        """Export BTC descriptor returns external + change descriptors and xpub."""
+        result = cli_runner("btc", "export-descriptor", "--wallet-name", wallet_name)
+        assert "external_descriptor" in result
+        assert "change_descriptor" in result
+        assert result["external_descriptor"].startswith("wpkh(")
+
+
+def _lightning_receive_enabled() -> bool:
+    """True when `aqua lightning receive` is actually registered for this config.
+
+    `lightning_receive` ships disabled (see `features._SHIPPED_DISABLED`), so the
+    command only exists when the user re-enabled it in ~/.aqua/config.json.
+    """
+    from aqua.features import is_tool_enabled, load_config_with_merge
+
+    return is_tool_enabled("lightning_receive", load_config_with_merge())
+
+
+_SKIP_IF_RECEIVE_DISABLED = pytest.mark.skipif(
+    not _lightning_receive_enabled(),
+    reason="lightning_receive ships disabled; enable it in ~/.aqua/config.json to smoke it",
+)
+
+
+@_SKIP_LIGHTNING_OUTAGE
+@_SKIP_IF_RECEIVE_DISABLED
+class TestSmokeLightningReceive:
+    def test_lightning_receive(self, cli_runner, wallet_name):
+        """Generate a Lightning invoice for 500 sats."""
+        result = cli_runner(
+            "lightning", "receive",
+            "--amount", "500",
+            "--wallet-name", wallet_name,
+        )
+        assert "swap_id" in result
+        assert "invoice" in result
+        assert result["amount"] == 500
+        TestSmokeLightningReceive._swap_id = result["swap_id"]
+
+
+@_SKIP_LIGHTNING_OUTAGE
+class TestSmokeLightningStatus:
+    def test_lightning_status(self, cli_runner):
+        """Check status of the receive swap created above."""
+        swap_id = getattr(TestSmokeLightningReceive, "_swap_id", None)
+        if swap_id is None:
+            pytest.skip("No swap_id from lightning receive test")
+        result = cli_runner("lightning", "status", "--swap-id", swap_id)
+        assert "swap_id" in result
+        assert "status" in result
+
+
+class TestSmokeDeleteWallet:
+	def test_delete_wallet(self):
+		"""Import a throwaway wallet then delete it; verify it's gone."""
+		name = f"delete_test_{int(time.time())}"
+		runner = CliRunner()
+		result = runner.invoke(
+			cli,
+			["--format", "json", "wallet", "import-mnemonic",
+			 "--mnemonic-stdin", "--wallet-name", name],
+			input=DEFAULT_MNEMONIC + "\n",
+		)
+		assert result.exit_code == 0
+
+		result = runner.invoke(
+			cli,
+			["--format", "json", "wallet", "delete", "--wallet-name", name, "--confirm"],
+		)
+		assert result.exit_code == 0
+
+		result = runner.invoke(
+			cli,
+			["--format", "json", "wallet", "list"],
+		)
+		assert result.exit_code == 0
+		wallets = json.loads(result.stdout)
+		wallet_names = [w["name"] if isinstance(w, dict) else w for w in wallets["wallets"]]
+		assert name not in wallet_names
+
+
+class TestSmokeSeedRestore:
+	def test_seed_backup_and_restore(self):
+		"""Re-importing the same mnemonic + password yields the same BTC address."""
+		name = f"test_seed_restore_{int(time.time())}"
+		runner = CliRunner()
+		result = runner.invoke(
+			cli,
+			["--format", "json", "wallet", "import-mnemonic",
+			 "--mnemonic-stdin", "--password-stdin", "--wallet-name", name],
+			input=DEFAULT_MNEMONIC + "\ntest\n",
+		)
+		assert result.exit_code == 0
+
+		result = runner.invoke(
+			cli,
+			["--format", "json", "btc", "address", "--wallet-name", name],
+		)
+		assert result.exit_code == 0
+		first_address = json.loads(result.stdout)["address"]
+
+		runner.invoke(cli, ["--format", "json", "wallet", "delete", "--wallet-name", name, "--confirm"])
+
+		result = runner.invoke(
+			cli,
+			["--format", "json", "wallet", "import-mnemonic",
+			 "--mnemonic-stdin", "--password-stdin", "--wallet-name", name],
+			input=DEFAULT_MNEMONIC + "\ntest\n",
+		)
+		assert result.exit_code == 0
+
+		result = runner.invoke(
+			cli,
+			["--format", "json", "btc", "address", "--wallet-name", name],
+		)
+		assert result.exit_code == 0
+		restored_address = json.loads(result.stdout)["address"]
+		assert restored_address == first_address
+
+		runner.invoke(cli, ["--format", "json", "wallet", "delete", "--wallet-name", name, "--confirm"])
+
+
+class TestSmokeImportLiquidDescriptor:
+    def test_import_liquid_descriptor(self):
+        """Import a Liquid watch-only wallet from CT_DESCRIPTOR_LIQUID env var."""
+        if not CT_DESCRIPTOR_LIQUID:
+            pytest.skip("CT_DESCRIPTOR_LIQUID not set")
+        name = f"smoke_liq_desc_{int(time.time())}"
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["--format", "json", "liquid", "import-descriptor",
+             "--descriptor", CT_DESCRIPTOR_LIQUID, "--wallet-name", name],
+        )
+        assert result.exit_code == 0, result.stdout
+        data = json.loads(result.stdout)
+        assert data["wallet_name"] == name
+        assert data["watch_only"] is True
+
+        runner.invoke(cli, ["--format", "json", "wallet", "delete", "--wallet-name", name, "--confirm"])
+
+
+class TestSmokeImportBtcDescriptor:
+    def test_import_btc_descriptor(self):
+        """Import a Bitcoin watch-only wallet from BTC_DESCRIPTOR env var."""
+        if not BTC_DESCRIPTOR:
+            pytest.skip("BTC_DESCRIPTOR not set")
+        name = f"smoke_btc_desc_{int(time.time())}"
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["--format", "json", "btc", "import-descriptor",
+             "--descriptor", BTC_DESCRIPTOR, "--wallet-name", name],
+        )
+        assert result.exit_code == 0, result.stdout
+        data = json.loads(result.stdout)
+        assert data["wallet_name"] == name
+        assert data["watch_only"] is True
+
+        runner.invoke(cli, ["--format", "json", "wallet", "delete", "--wallet-name", name, "--confirm"])
+
+
+class TestSmokeCleanup:
+    def test_delete_smoke_wallet(self, wallet_name):
+        """Delete the smoke wallet after all tests."""
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["--format", "json", "wallet", "delete", "--wallet-name", wallet_name, "--confirm"],
+        )
+        assert result.exit_code == 0

@@ -1,0 +1,77 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+.uv-bin/
+.github/worktree/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+pyrightconfig.json
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Type checking
+.mypy_cache/
+
+# Build
+*.manifest
+*.spec
+
+# Local config
+.env
+.env.local
+
+# Wallet data (never commit!)
+.liquid-wallet/  # Legacy, will be removed
+.aqua-mcp/      # Legacy, replaced by .aqua/
+.aqua/
+
+# AI
+.claude/
+.cursor/
+.aider/
+.tldr/
+.tldrignore
+.mcp.json
+specs/
+.omc/
+.omx/
+.worktrees/
+.atl/
+.codegraph/
+
+# Internal docs kept out of the repo and the sdist
+secrets/

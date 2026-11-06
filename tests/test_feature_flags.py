@@ -1,0 +1,272 @@
+"""Tests for runtime feature-flag gating of MCP tools and CLI commands."""
+
+import logging
+import tempfile
+from pathlib import Path
+
+import click
+import pytest
+from click.testing import CliRunner
+from mcp.server import Server
+
+from aqua.cli.commands import register_commands
+from aqua.features import (
+    CLI_COMMAND_TO_MCP_TOOL,
+    MCP_ONLY_TOOLS,
+    SHIPPED_DEFAULTS_ENABLED_TOOLS,
+    load_config_with_merge,
+)
+from aqua.server import _make_handlers
+from aqua.storage import Config, Storage
+from aqua.tools import TOOLS
+
+
+@pytest.fixture
+def temp_storage():
+    """Fresh Storage rooted at a tmpdir for full isolation from ~/.aqua/."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        yield Storage(Path(tmpdir))
+
+
+def _make_test_cli() -> click.Group:
+    """Build a minimal root group mirroring main.cli for testing."""
+
+    @click.group()
+    def root():
+        pass
+
+    return root
+
+
+def _registered_handler(server: Server, request_type) -> callable:
+    """Pull the registered handler for a given request type out of `server`."""
+    handler = server.request_handlers.get(request_type)
+    assert handler is not None, f"no handler registered for {request_type}"
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_disabled_tool_hidden_from_list_tools():
+    """A tool with `enabled_tools[name] = False` is excluded from list_tools."""
+    import mcp.types as types
+
+    config = Config(enabled_tools={"lw_balance": False})
+    server = Server("test")
+    _make_handlers(server, config)
+
+    handler = _registered_handler(server, types.ListToolsRequest)
+    req = types.ListToolsRequest(method="tools/list")
+    result = await handler(req)
+    # ServerResult wraps a ListToolsResult under .root
+    tools = result.root.tools
+    names = [t.name for t in tools]
+    assert "lw_balance" not in names
+    # other tools unaffected
+    assert "btc_balance" in names
+
+
+@pytest.mark.asyncio
+async def test_disabled_tool_unknown_on_call_tool():
+    """call_tool on a disabled tool returns the EXACT `Unknown tool: <name>` text."""
+    import mcp.types as types
+
+    config = Config(enabled_tools={"lw_balance": False})
+    server = Server("test")
+    _make_handlers(server, config)
+
+    handler = _registered_handler(server, types.CallToolRequest)
+
+    # Disabled tool
+    req_disabled = types.CallToolRequest(
+        method="tools/call",
+        params=types.CallToolRequestParams(name="lw_balance", arguments={}),
+    )
+    res_disabled = await handler(req_disabled)
+    text_disabled = res_disabled.root.content[0].text
+
+    # Genuinely unknown tool
+    req_unknown = types.CallToolRequest(
+        method="tools/call",
+        params=types.CallToolRequestParams(name="nonexistent_tool", arguments={}),
+    )
+    res_unknown = await handler(req_unknown)
+    text_unknown = res_unknown.root.content[0].text
+
+    assert text_disabled == "Unknown tool: lw_balance"
+    assert text_unknown == "Unknown tool: nonexistent_tool"
+    # Same shape — no leakage of the "disabled" state.
+    assert text_disabled.startswith("Unknown tool: ")
+    assert text_unknown.startswith("Unknown tool: ")
+
+
+def test_cli_help_omits_disabled(temp_storage):
+    """`aqua liquid --help` omits commands whose mapped MCP tool is disabled."""
+    import re
+
+    enabled = dict(SHIPPED_DEFAULTS_ENABLED_TOOLS)
+    enabled["lw_balance"] = False
+    temp_storage.save_config(Config(enabled_tools=enabled))
+    config = load_config_with_merge(temp_storage)
+
+    fresh_cli = _make_test_cli()
+    register_commands(fresh_cli, config=config)
+
+    runner = CliRunner()
+    result = runner.invoke(fresh_cli, ["liquid", "--help"])
+    assert result.exit_code == 0
+    # Match the Click-rendered command listing only (indented + whitespace
+    # after the name), so help text in OTHER commands' descriptions that
+    # happens to contain the word "balance" doesn't trip this check.
+    assert not re.search(r"^\s+balance\s", result.output, re.MULTILINE)
+
+
+def test_cli_disabled_command_exits_2(temp_storage):
+    """Invoking a disabled CLI command returns Click's `No such command` (exit 2)."""
+    enabled = dict(SHIPPED_DEFAULTS_ENABLED_TOOLS)
+    enabled["lw_balance"] = False
+    temp_storage.save_config(Config(enabled_tools=enabled))
+    config = load_config_with_merge(temp_storage)
+
+    fresh_cli = _make_test_cli()
+    register_commands(fresh_cli, config=config)
+
+    runner = CliRunner()
+    result = runner.invoke(fresh_cli, ["liquid", "balance"])
+    assert result.exit_code == 2
+    assert "No such command" in result.output
+
+
+def test_mapping_targets_real_tools():
+    """Every value in CLI_COMMAND_TO_MCP_TOOL must be a real MCP tool name."""
+    for mcp_name in CLI_COMMAND_TO_MCP_TOOL.values():
+        assert mcp_name in TOOLS, f"mapping target {mcp_name!r} not in TOOLS"
+
+
+def test_every_mcp_tool_is_mapped_or_explicitly_mcp_only():
+    """Drift guard: every MCP tool has a CLI mapping OR is in MCP_ONLY_TOOLS."""
+    mapped = set(CLI_COMMAND_TO_MCP_TOOL.values())
+    assert set(TOOLS.keys()) == mapped | MCP_ONLY_TOOLS, (
+        "unmapped: "
+        + str(set(TOOLS.keys()) - mapped - MCP_ONLY_TOOLS)
+        + "; phantom mappings: "
+        + str(mapped - set(TOOLS.keys()))
+    )
+
+
+def test_unknown_enabled_tools_key_warns(temp_storage, caplog):
+    """Unknown tool names in enabled_tools log a warning but do not crash."""
+    temp_storage.save_config(Config(enabled_tools={"bogus_tool": True}))
+    with caplog.at_level(logging.WARNING, logger="aqua.features"):
+        config = load_config_with_merge(temp_storage)
+    assert any("bogus_tool" in rec.message for rec in caplog.records)
+    # No crash; config still loaded with shipped defaults merged in.
+    assert "lw_balance" in config.enabled_tools
+
+
+def test_fresh_install_does_not_write_config(temp_storage):
+    """Startup is read-only: a fresh install must NOT create config.json.
+
+    An absent key means "use the shipped default"; `doctor` is the only path
+    that writes config.json.
+    """
+    assert not temp_storage.config_path.exists()
+    config = load_config_with_merge(temp_storage)
+    # Read-only: no file was created.
+    assert not temp_storage.config_path.exists()
+    # In-memory merge still yields every shipped default for gating.
+    assert config.enabled_tools == SHIPPED_DEFAULTS_ENABLED_TOOLS
+
+
+def test_startup_survives_corrupt_config(temp_storage, caplog):
+    """A malformed config.json must not crash startup (so `doctor` can run)."""
+    temp_storage.config_path.write_text("{not valid json")
+    with caplog.at_level(logging.WARNING, logger="aqua.features"):
+        config = load_config_with_merge(temp_storage)
+    # Degrades to in-memory defaults, warns, and points at doctor.
+    assert config.enabled_tools == SHIPPED_DEFAULTS_ENABLED_TOOLS
+    assert any("doctor" in rec.message for rec in caplog.records)
+    # Read-only: the corrupt file is left as-is for doctor to inspect.
+    assert temp_storage.config_path.read_text() == "{not valid json"
+
+
+def test_startup_survives_unknown_top_level_key(temp_storage):
+    """An unknown top-level key must not crash startup (dropped in memory)."""
+    temp_storage.config_path.write_text('{"version": 9, "network": "mainnet"}')
+    config = load_config_with_merge(temp_storage)
+    assert config.network == "mainnet"
+    assert config.enabled_tools == SHIPPED_DEFAULTS_ENABLED_TOOLS
+
+
+def test_startup_does_not_persist_or_repopulate(temp_storage):
+    """Loading a sparse config never rewrites it (no re-pollution with defaults)."""
+    temp_storage.save_config(Config(enabled_tools={"lw_balance": False}))
+    before = temp_storage.config_path.read_text()
+    config = load_config_with_merge(temp_storage)
+    after = temp_storage.config_path.read_text()
+    # Untouched on disk...
+    assert before == after
+    # ...but merged in memory for gating.
+    assert config.enabled_tools["lw_balance"] is False
+    assert config.enabled_tools["btc_balance"] is True
+
+
+def test_cli_only_serve_always_registers(temp_storage):
+    """`serve` is CLI-only and must register even when every tool is disabled."""
+    enabled = {name: False for name in SHIPPED_DEFAULTS_ENABLED_TOOLS}
+    temp_storage.save_config(Config(enabled_tools=enabled))
+    config = load_config_with_merge(temp_storage)
+
+    fresh_cli = _make_test_cli()
+    register_commands(fresh_cli, config=config)
+    assert "serve" in fresh_cli.commands
+
+
+def test_enabled_tools_invalid_types_are_coerced(caplog):
+    """Non-bool values in enabled_tools are dropped (fails closed, not open).
+
+    Without coercion, `{"lw_send": "yes"}` would silently treat lw_send as
+    enabled via Python truthiness. The coercion at Config.from_dict prevents
+    that.
+    """
+    with caplog.at_level(logging.WARNING, logger="aqua.storage"):
+        config = Config.from_dict(
+            {
+                "enabled_tools": {
+                    "lw_send": "yes",  # invalid: string instead of bool
+                    "lw_balance": True,  # valid
+                    "btc_send": {"nested": True},  # invalid: dict
+                    42: True,  # invalid: non-string key
+                }
+            }
+        )
+    # Only the well-typed entry survives.
+    assert config.enabled_tools == {"lw_balance": True}
+    # All three invalid entries logged.
+    assert sum("Dropping invalid" in r.message for r in caplog.records) == 3
+
+
+def test_only_lightning_receive_ships_disabled():
+    """`lightning_receive` is the single opt-out; every other tool ships enabled."""
+    from aqua.features import _SHIPPED_DISABLED
+
+    assert _SHIPPED_DISABLED == frozenset({"lightning_receive"})
+    assert SHIPPED_DEFAULTS_ENABLED_TOOLS["lightning_receive"] is False
+    for name, enabled in SHIPPED_DEFAULTS_ENABLED_TOOLS.items():
+        if name in _SHIPPED_DISABLED:
+            continue
+        assert enabled is True, name
+
+
+def test_enabled_tools_non_dict_value_resets_to_empty(caplog):
+    """Top-level enabled_tools must be an object; lists/strings are rejected."""
+    with caplog.at_level(logging.WARNING, logger="aqua.storage"):
+        config = Config.from_dict({"enabled_tools": ["lw_send"]})
+    assert config.enabled_tools == {}
+    assert any("must be an object" in r.message for r in caplog.records)
+
+
+def test_removed_generate_mnemonic_in_user_config_does_not_crash(temp_storage):
+    """A config still listing the removed `lw_generate_mnemonic` loads (warning only)."""
+    temp_storage.config_path.write_text('{"enabled_tools": {"lw_generate_mnemonic": true}}')
+    config = load_config_with_merge(temp_storage)
+    assert "lw_create_wallet" in config.enabled_tools

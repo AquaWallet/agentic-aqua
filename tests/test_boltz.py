@@ -1,0 +1,489 @@
+"""Tests for Boltz Exchange integration module (Layers 1, 2, 3)."""
+
+import hashlib
+import json
+import ssl
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from aqua.boltz import (
+    BOLTZ_API,
+    BoltzClient,
+    BoltzSwapAlreadyExistsError,
+    SwapInfo,
+    _build_tls_context,
+    generate_keypair,
+    verify_preimage,
+)
+from aqua.bolt11 import (
+    _BECH32_CHARSET,
+    _polymod,
+    decode_bolt11_amount_sats,
+    decode_bolt11_payment_hash,
+)
+import io
+import urllib.error
+
+# ---------------------------------------------------------------------------
+# Mock helpers
+# ---------------------------------------------------------------------------
+
+MOCK_SUBMARINE_PAIRS = {
+    "L-BTC/BTC": {
+        "rate": 1.0,
+        "fees": {"percentage": 0.1, "minerFees": 19},
+        "limits": {"maximal": 25000000, "minimal": 1000, "maximalZeroConf": 500000},
+    }
+}
+
+MOCK_SWAP_RESPONSE = {
+    "id": "test_swap_123",
+    "address": "lq1qqexampleaddress",
+    "expectedAmount": 50069,
+    "claimPublicKey": "03" + "ab" * 32,
+    "swapTree": {
+        "claimLeaf": {"version": 192, "output": "a914..."},
+        "refundLeaf": {"version": 192, "output": "b914..."},
+    },
+    "timeoutBlockHeight": 2500000,
+}
+
+MOCK_CLAIM_DETAILS = {
+    "preimage": "aa" * 32,
+    "transactionHash": "bb" * 32,
+    "pubNonce": "cc" * 33,
+}
+
+
+def _mock_response(data, status=200):
+    """Create a mock urllib response (context manager)."""
+    resp = MagicMock()
+    if isinstance(data, dict):
+        resp.read.return_value = json.dumps(data).encode()
+    else:
+        resp.read.return_value = data
+    resp.__enter__ = MagicMock(return_value=resp)
+    resp.__exit__ = MagicMock(return_value=False)
+    return resp
+
+
+# ===========================================================================
+# Layer 1: Cryptographic utilities
+# ===========================================================================
+
+
+class TestGenerateKeypair:
+    """Tests for generate_keypair() - uses coincurve real."""
+
+    def test_generate_keypair_returns_hex_strings(self):
+        """Returns (privkey_hex, pubkey_hex) with correct sizes."""
+        privkey, pubkey = generate_keypair()
+
+        # privkey: 32 bytes = 64 hex chars
+        assert len(privkey) == 64
+        bytes.fromhex(privkey)  # valid hex
+
+        # pubkey: 33 bytes compressed = 66 hex chars, starts with 02 or 03
+        assert len(pubkey) == 66
+        bytes.fromhex(pubkey)  # valid hex
+        assert pubkey[:2] in ("02", "03")
+
+    def test_generate_keypair_unique_per_call(self):
+        """Two calls produce different keypairs."""
+        priv1, pub1 = generate_keypair()
+        priv2, pub2 = generate_keypair()
+        assert priv1 != priv2
+        assert pub1 != pub2
+
+
+class TestVerifyPreimage:
+    """Tests for verify_preimage() - uses hashlib real."""
+
+    def test_verify_preimage_valid(self):
+        """Returns True when SHA256(preimage) == expected_hash."""
+        preimage = "aa" * 32
+        expected = hashlib.sha256(bytes.fromhex(preimage)).hexdigest()
+        assert verify_preimage(preimage, expected) is True
+
+    def test_verify_preimage_invalid(self):
+        """Returns False when hash doesn't match."""
+        preimage = "aa" * 32
+        wrong_hash = "bb" * 32
+        assert verify_preimage(preimage, wrong_hash) is False
+
+    def test_verify_preimage_invalid_hex_raises(self):
+        """Raises ValueError for invalid hex input."""
+        with pytest.raises(ValueError):
+            verify_preimage("xyz_not_hex", "aa" * 32)
+
+
+# ===========================================================================
+# TLS hardening (commit 32d7229)
+# ===========================================================================
+
+
+class TestTlsContext:
+    """Tests for the hardened TLS context used by BoltzClient."""
+
+    def test_build_tls_context_is_hardened(self):
+        """Guard against future weakening: TLS 1.2 floor + hostname + cert verification."""
+        ctx = _build_tls_context()
+        assert ctx.minimum_version >= ssl.TLSVersion.TLSv1_2
+        assert ctx.check_hostname is True
+        assert ctx.verify_mode == ssl.CERT_REQUIRED
+
+    def test_client_rejects_non_https_base_url(self, monkeypatch):
+        """Constructor refuses to talk to plaintext endpoints, even if config drifts."""
+        monkeypatch.setitem(BOLTZ_API, "mainnet", "http://api.boltz.exchange")
+        with pytest.raises(ValueError, match="must be https"):
+            BoltzClient(network="mainnet")
+
+    @patch("aqua.boltz.urllib.request.urlopen")
+    def test_api_request_passes_tls_context_to_urlopen(self, mock_urlopen):
+        """Injected context must reach urlopen — otherwise hardening is silent."""
+        mock_urlopen.return_value = _mock_response(MOCK_SUBMARINE_PAIRS)
+        custom = ssl.create_default_context()
+        client = BoltzClient(network="mainnet", tls_context=custom)
+
+        client.get_submarine_pairs()
+
+        assert mock_urlopen.call_args.kwargs.get("context") is custom
+
+
+# ===========================================================================
+# Layer 2: BoltzClient HTTP
+# ===========================================================================
+
+
+class TestBoltzClient:
+    """Tests for BoltzClient with mocked HTTP."""
+
+    @patch("aqua.boltz.urllib.request.urlopen")
+    def test_get_submarine_pairs_returns_lbtc_btc(self, mock_urlopen):
+        """GET /v2/swap/submarine returns L-BTC/BTC pair info."""
+        mock_urlopen.return_value = _mock_response(MOCK_SUBMARINE_PAIRS)
+        client = BoltzClient(network="mainnet")
+        result = client.get_submarine_pairs()
+
+        assert "L-BTC/BTC" in result
+        pair = result["L-BTC/BTC"]
+        assert "fees" in pair
+        assert "limits" in pair
+        assert pair["fees"]["percentage"] == 0.1
+        assert pair["limits"]["minimal"] == 1000
+
+    @patch("aqua.boltz.urllib.request.urlopen")
+    def test_create_submarine_swap_sends_correct_body(self, mock_urlopen):
+        """POST body contains invoice, from, to, refundPublicKey."""
+        mock_urlopen.return_value = _mock_response(MOCK_SWAP_RESPONSE)
+        client = BoltzClient(network="mainnet")
+
+        invoice = "lnbc500u1ptest..."
+        refund_pubkey = "03" + "ff" * 32
+        client.create_submarine_swap(invoice, refund_pubkey)
+
+        # Capture the Request object passed to urlopen
+        call_args = mock_urlopen.call_args
+        request_obj = call_args[0][0] if call_args[0] else call_args[1].get("url")
+        body = json.loads(request_obj.data.decode())
+
+        assert body["invoice"] == invoice
+        assert body["from"] == "L-BTC"
+        assert body["to"] == "BTC"
+        assert body["refundPublicKey"] == refund_pubkey
+
+    @patch("aqua.boltz.urllib.request.urlopen")
+    def test_create_submarine_swap_returns_swap_data(self, mock_urlopen):
+        """Response is parsed into dict with expected fields."""
+        mock_urlopen.return_value = _mock_response(MOCK_SWAP_RESPONSE)
+        client = BoltzClient(network="mainnet")
+
+        result = client.create_submarine_swap("lnbc500u1ptest...", "03" + "ff" * 32)
+
+        assert result["id"] == "test_swap_123"
+        assert result["address"] == "lq1qqexampleaddress"
+        assert result["expectedAmount"] == 50069
+        assert "claimPublicKey" in result
+        assert "swapTree" in result
+        assert "timeoutBlockHeight" in result
+
+    @patch("aqua.boltz.urllib.request.urlopen")
+    def test_get_swap_status_returns_status(self, mock_urlopen):
+        """get_swap_status returns current swap status."""
+        mock_urlopen.return_value = _mock_response({"status": "transaction.mempool"})
+        client = BoltzClient(network="mainnet")
+
+        result = client.get_swap_status("test_swap_123")
+        assert result["status"] == "transaction.mempool"
+
+    @patch("aqua.boltz.urllib.request.urlopen")
+    def test_get_claim_details_returns_preimage(self, mock_urlopen):
+        """get_claim_details returns preimage and transactionHash."""
+        mock_urlopen.return_value = _mock_response(MOCK_CLAIM_DETAILS)
+        client = BoltzClient(network="mainnet")
+
+        result = client.get_claim_details("test_swap_123")
+        assert result["preimage"] == "aa" * 32
+        assert result["transactionHash"] == "bb" * 32
+
+    @patch("aqua.boltz.urllib.request.urlopen")
+    def test_api_request_http_error_includes_boltz_message(self, mock_urlopen):
+        """HTTP errors include Boltz error detail in RuntimeError."""
+
+        err = urllib.error.HTTPError(
+            url="https://api.boltz.exchange/v2/swap/submarine",
+            code=400,
+            msg="Bad Request",
+            hdrs=None,
+            fp=io.BytesIO(json.dumps({"error": "invoice already used"}).encode()),
+        )
+        mock_urlopen.side_effect = err
+        client = BoltzClient(network="mainnet")
+
+        with pytest.raises(RuntimeError, match="invoice already used"):
+            client.get_submarine_pairs()
+
+    @patch("aqua.boltz.urllib.request.urlopen")
+    def test_api_request_duplicate_invoice_raises_specific_error(self, mock_urlopen):
+        """409 duplicate invoice response raises a dedicated error."""
+        err = urllib.error.HTTPError(
+            url="https://api.boltz.exchange/v2/swap/submarine",
+            code=409,
+            msg="Conflict",
+            hdrs=None,
+            fp=io.BytesIO(json.dumps({"error": "a swap with this invoice exists already"}).encode()),
+        )
+        mock_urlopen.side_effect = err
+        client = BoltzClient(network="mainnet")
+
+        with pytest.raises(BoltzSwapAlreadyExistsError, match="already exists"):
+            client.create_submarine_swap("lnbc500u1ptest...", "03" + "ff" * 32)
+
+    @patch("aqua.boltz.urllib.request.urlopen")
+    def test_api_request_http_error_without_body(self, mock_urlopen):
+        """HTTP errors without parseable body still produce a useful message."""
+        err = urllib.error.HTTPError(
+            url="https://api.boltz.exchange/v2/swap/submarine",
+            code=500,
+            msg="Internal Server Error",
+            hdrs=None,
+            fp=io.BytesIO(b"not json"),
+        )
+        mock_urlopen.side_effect = err
+        client = BoltzClient(network="mainnet")
+
+        with pytest.raises(RuntimeError, match="Boltz API error.*500"):
+            client.get_submarine_pairs()
+
+    @patch("aqua.boltz.urllib.request.urlopen")
+    def test_api_request_timeout_raises(self, mock_urlopen):
+        """Network timeout raises RuntimeError with context."""
+
+        mock_urlopen.side_effect = urllib.error.URLError("timeout")
+        client = BoltzClient(network="mainnet")
+
+        with pytest.raises(RuntimeError, match="Boltz API unreachable"):
+            client.get_submarine_pairs()
+
+    @patch("aqua.boltz.urllib.request.urlopen")
+    def test_api_request_invalid_json_raises(self, mock_urlopen):
+        """Non-JSON response raises exception."""
+        mock_urlopen.return_value = _mock_response(b"not json at all")
+        client = BoltzClient(network="mainnet")
+
+        with pytest.raises(Exception):
+            client.get_submarine_pairs()
+
+
+# ===========================================================================
+# Layer 3: SwapInfo dataclass
+# ===========================================================================
+
+
+class TestSwapInfo:
+    """Tests for SwapInfo dataclass."""
+
+    def _make_swap(self, **overrides) -> SwapInfo:
+        """Create a SwapInfo with default values."""
+        defaults = {
+            "swap_id": "test_swap_123",
+            "address": "lq1qqexampleaddress",
+            "expected_amount": 50069,
+            "claim_public_key": "03" + "ab" * 32,
+            "swap_tree": {"claimLeaf": {}, "refundLeaf": {}},
+            "timeout_block_height": 2500000,
+            "refund_private_key": "aa" * 32,
+            "refund_public_key": "03" + "cc" * 32,
+            "invoice": "lnbc500u1ptest...",
+            "status": "swap.created",
+            "network": "mainnet",
+            "created_at": "2026-03-05T12:00:00",
+        }
+        defaults.update(overrides)
+        return SwapInfo(**defaults)
+
+    def test_swap_info_to_dict_roundtrip(self):
+        """SwapInfo serializes to dict and reconstructs without data loss."""
+        original = self._make_swap(
+            lockup_txid="dd" * 32,
+            preimage="ee" * 32,
+            claim_txid="ff" * 32,
+        )
+        data = original.to_dict()
+        reconstructed = SwapInfo(**data)
+
+        assert reconstructed == original
+
+    def test_swap_info_optional_fields_default_none(self):
+        """Optional fields default to None."""
+        swap = self._make_swap()
+        assert swap.lockup_txid is None
+        assert swap.preimage is None
+        assert swap.claim_txid is None
+
+
+# ===========================================================================
+# BOLT11 invoice amount decoder
+# ===========================================================================
+
+
+def _with_checksum(hrp: str, data: str = "pqpqpq") -> str:
+    """Build a bech32 string with a valid checksum (no BOLT11 tagged fields)."""
+    expanded = [ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp]
+    values = [_BECH32_CHARSET.index(c) for c in data]
+    mod = _polymod(expanded + values + [0] * 6) ^ 1
+    check = "".join(_BECH32_CHARSET[(mod >> 5 * (5 - i)) & 31] for i in range(6))
+    return f"{hrp}1{data}{check}"
+
+
+class TestDecodeBolt11AmountSats:
+    """Tests for decode_bolt11_amount_sats."""
+
+    @pytest.mark.parametrize("invoice, expected_sats", [
+        (_with_checksum("lnbc500u"), 50_000),           # 500 micro-BTC
+        (_with_checksum("lnbc1m"), 100_000),             # 1 milli-BTC
+        (_with_checksum("lnbc10m"), 1_000_000),          # 10 milli-BTC
+        (_with_checksum("lnbc2500u"), 250_000),          # 2500 micro-BTC
+        (_with_checksum("lnbc1500n"), 150),              # 1500 nano-BTC
+        (_with_checksum("lnbc2"), 200_000_000),          # 2 BTC (no multiplier)
+        (_with_checksum("lntb500u"), 50_000),            # testnet
+    ])
+    def test_known_amounts(self, invoice, expected_sats):
+        assert decode_bolt11_amount_sats(invoice) == expected_sats
+
+    def test_zero_amount_invoice_returns_none(self):
+        assert decode_bolt11_amount_sats(_with_checksum("lnbc")) is None
+
+    @pytest.mark.parametrize("invoice", ["xxinvalid", "", _with_checksum("btc500u")])
+    def test_invalid_invoice_is_rejected(self, invoice):
+        with pytest.raises(ValueError, match="Invalid BOLT11"):
+            decode_bolt11_amount_sats(invoice)
+
+    def test_case_insensitive(self):
+        assert decode_bolt11_amount_sats(_with_checksum("lnbc500u").upper()) == 50_000
+
+
+class TestRefundEndpoints:
+    """The endpoints a refund needs; Indra inherits them from BoltzClient."""
+
+    @staticmethod
+    def _request(mock_urlopen):
+        call_args = mock_urlopen.call_args
+        return call_args[0][0] if call_args[0] else call_args[1].get("url")
+
+    @patch("aqua.boltz.urllib.request.urlopen")
+    def test_post_refund_signature_sends_musig_material(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response(
+            {"pubNonce": "02" + "aa" * 32 + "03" + "bb" * 32, "partialSignature": "cc" * 32}
+        )
+        client = BoltzClient(network="mainnet")
+
+        result = client.post_refund_signature(
+            "swap_1", pub_nonce="dd" * 66, transaction_hex="0200beef", index=0
+        )
+
+        request = self._request(mock_urlopen)
+        assert request.full_url.endswith("/v2/swap/submarine/swap_1/refund")
+        assert request.get_method() == "POST"
+        body = json.loads(request.data.decode())
+        assert body == {
+            "pubNonce": "dd" * 66,
+            "transaction": "0200beef",
+            "index": 0,
+        }
+        assert result["partialSignature"] == "cc" * 32
+
+    @patch("aqua.boltz.urllib.request.urlopen")
+    def test_get_chain_fees(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response({"BTC": 2.0, "L-BTC": 0.1})
+        client = BoltzClient(network="mainnet")
+
+        assert client.get_chain_fees()["L-BTC"] == 0.1
+        assert self._request(mock_urlopen).full_url.endswith("/v2/chain/fees")
+
+    @patch("aqua.boltz.urllib.request.urlopen")
+    def test_broadcast_transaction_returns_txid(self, mock_urlopen):
+        mock_urlopen.return_value = _mock_response({"id": "broadcast_txid"})
+        client = BoltzClient(network="mainnet")
+
+        assert client.broadcast_transaction("0200beef") == "broadcast_txid"
+        request = self._request(mock_urlopen)
+        assert request.full_url.endswith("/v2/chain/L-BTC/transaction")
+        assert json.loads(request.data.decode()) == {"hex": "0200beef"}
+
+    @patch("aqua.boltz.urllib.request.urlopen")
+    def test_broadcast_without_txid_is_an_error(self, mock_urlopen):
+        """Never report success for a broadcast the provider did not confirm."""
+        mock_urlopen.return_value = _mock_response({})
+        client = BoltzClient(network="mainnet")
+
+        with pytest.raises(RuntimeError, match="no txid"):
+            client.broadcast_transaction("0200beef")
+
+
+class TestDecodeBolt11PaymentHash:
+    """The payment hash drives the claim leaf, so a bad one breaks the refund."""
+
+    def test_extracts_hash_from_real_invoices(self):
+        cases = [
+            (
+                "lnbc10u1p42egntpp5yqh5zhr53syucv9akmnd5teq3fv9k9s0rr542v6y75sjw42zz2qssp5"
+                "tnmffnsyggjjkha9m8wdj4q58pgugkf67n84znr343clwa4qqmsqxq9z0rgqnp4qvyndeaqz"
+                "man7h898jxm98dzkm0mlrsx36s93smrur7h0azyyuxc5rzjqwghf7zxvfkxq5a6sr65g0gdk"
+                "v768p83mhsnt0msszapamzx2qvuxqqqqrt49lmtcqqqqqqqqqqq86qq9qrzjqdqk3f6qkpdx"
+                "8s74wngv95h3dkumkdyyh0g5mv6jetkskxkcsvf74apyqr6zgqqqq8hxk2qqae4jsqyugqcq"
+                "zpudz22pshjgr5dus9wctvd3jhggr0vcs9xct5daeks6fqw4ek2u36ypkk7er9wd6xxmmvda"
+                "h8jdenxs9qyyssqjhpzrzh9p2n7anyttev32ndq3c3vuyfrxvanh2qqjre2ag3mf4lhxce9z"
+                "5c8vylpvl3tnztpanlvsmmevjlya9cj3glz6k6qxr8ddqcq3m7vc9",
+                "202f415c748c09cc30bdb6e6da2f208a585b160f18e9553344f5212755421281",
+            ),
+        ]
+        for invoice, expected in cases:
+            assert decode_bolt11_payment_hash(invoice) == expected
+
+    def test_case_insensitive(self):
+        invoice = (
+            "lnbc10u1p42egntpp5yqh5zhr53syucv9akmnd5teq3fv9k9s0rr542v6y75sjw42zz2qssp5"
+            "tnmffnsyggjjkha9m8wdj4q58pgugkf67n84znr343clwa4qqmsqxq9z0rgqnp4qvyndeaqz"
+            "man7h898jxm98dzkm0mlrsx36s93smrur7h0azyyuxc5rzjqwghf7zxvfkxq5a6sr65g0gdk"
+            "v768p83mhsnt0msszapamzx2qvuxqqqqrt49lmtcqqqqqqqqqqq86qq9qrzjqdqk3f6qkpdx"
+            "8s74wngv95h3dkumkdyyh0g5mv6jetkskxkcsvf74apyqr6zgqqqq8hxk2qqae4jsqyugqcq"
+            "zpudz22pshjgr5dus9wctvd3jhggr0vcs9xct5daeks6fqw4ek2u36ypkk7er9wd6xxmmvda"
+            "h8jdenxs9qyyssqjhpzrzh9p2n7anyttev32ndq3c3vuyfrxvanh2qqjre2ag3mf4lhxce9z"
+            "5c8vylpvl3tnztpanlvsmmevjlya9cj3glz6k6qxr8ddqcq3m7vc9"
+        )
+        assert decode_bolt11_payment_hash(invoice.upper()) == decode_bolt11_payment_hash(
+            invoice
+        )
+
+    def test_rejects_valid_invoice_without_a_payment_hash(self):
+        with pytest.raises(ValueError, match="payment hash"):
+            decode_bolt11_payment_hash(_with_checksum("lnbc500u"))
+
+    @pytest.mark.parametrize(
+        "invoice", ["", "not-an-invoice", "lnbc500u1ptest_valid_invoice"]
+    )
+    def test_rejects_malformed_invoices(self, invoice):
+        with pytest.raises(ValueError, match="Invalid BOLT11"):
+            decode_bolt11_payment_hash(invoice)

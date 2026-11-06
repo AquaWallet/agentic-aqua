@@ -1,0 +1,64 @@
+<!-- Parent: ../AGENTS.md -->
+<!-- Generated: 2026-05-20 | Updated: 2026-05-20 -->
+
+# src/aqua/cli
+
+Click CLI that mirrors the MCP tool surface. Same managers, same error envelope — just
+rendered to terminal/JSON instead of MCP responses.
+
+## Module map
+
+| File | Group | Purpose |
+|------|-------|---------|
+| `main.py` | root `aqua` | Click group, loads `.env`, sets up `AquaContext` (format, verbose). `--format json\|pretty` (auto-detected from `isatty`). |
+| `commands.py` | — | Wires subgroups into the root. Single place to register. |
+| `wallet.py` | `aqua wallet` | Generate, import, export, list, delete wallets. |
+| `liquid.py` | `aqua liquid` | Liquid balance, address, send, transactions. |
+| `btc.py` | `aqua btc` | Bitcoin equivalents. |
+| `lightning.py` | `aqua lightning` | Send (Indra/Boltz), status, refund, decode. `receive` (Ankara) is gated off by default. |
+| `sideshift.py` | `aqua sideshift` | Cross-chain quote, send, receive, status. |
+| `changelly.py` | `aqua changelly` | USDt cross-chain quote, send, receive, status. |
+| `eulen.py` | `aqua eulen` | Ankara-backed hosted KYC session (`--method otp|pix`, `--amount-cents`, `--wallet-name`) / confirm (`--wait` polls every 15 s while `created`) and PIX→DePix receive/list/status commands. |
+| `jan3.py` | `aqua jan3` | JAN3 account login + sessions (multi-account, one per email): `login`/`verify` (free email-OTP, default), `login-start`/`login-complete` (paid captchaless fallback), `session-info`/`list-sessions`/`logout`. Maps to the `jan3_*` tools; decoupled from WapuPay's API key. |
+| `wapupay.py` | `aqua wapupay` | Argentine direct-fiat (calls WapuPay directly; needs an API key — env `WAPUPAY_API_KEY` or `provision-account --email`): rates (public), quote, create-order (→ Liquid funding address; `--funding-method USDT|LBTC`), fund-order, order-status, transactions, transaction, spending-limit, provision-account (get/rotate the API key via your JAN3 login for `--email`, stored locally). |
+| `serve.py` | `aqua serve` | Run the MCP stdio server from the CLI. |
+| `output.py` | helper | JSON / pretty rendering. Pretty mode uses `click.echo`; JSON dumps via `json.dumps(..., indent=2)`. |
+| `password.py` | helper | Secret resolution chain. See below. |
+
+## Password / secret resolution
+
+`password.resolve_secret(label, use_stdin, env_var, required)` — order of precedence:
+
+1. `--password-stdin` flag set ⇒ `read_secret()` (piped stdin or TTY prompt).
+2. `--password-file PATH` (shared `password.password_file_option`, add it to every command
+   with `--password-stdin` and pass `password_file=` to `resolve_secret`) ⇒
+   `storage.read_password_file()`. Combined with `--password-stdin` ⇒ `click.UsageError`.
+   Wallet password only: mnemonic resolution never takes a file.
+3. `env_var` set in the environment and non-empty (whitespace stripped).
+4. `required=True` ⇒ interactive `click.prompt(hide_input=True)`.
+5. Else `None`.
+
+Standard env vars: `AQUA_PASSWORD` for wallet at-rest, `AQUA_MNEMONIC` /
+`SIGNER_MNEMONIC` for imports in tests/CI.
+
+`handle_password_retry(fn, kwargs)` wraps a manager call: if `fn` raises `ValueError`
+containing "password required" and the caller didn't supply one, prompt once and retry.
+Use this pattern for any new command that signs transactions.
+
+## Conventions
+
+- One subcommand file per MCP tool group; mirror tool names with dashes
+  (`lw_send` → `aqua liquid send`).
+- All amounts on the wire are sats (integer). Don't accept decimal BTC at the CLI layer.
+- Use `AquaContext.fmt` via `ctx.obj` to pick output mode; don't print directly to stdout
+  outside `output.py`.
+- Errors: catch `ValueError` at the command boundary and render via the error envelope.
+  Do not let raw tracebacks reach the user unless `--verbose`.
+- New CLI command → register in `commands.py`, add a smoke test in `tests/test_cli.py`.
+
+## SideSwap
+
+SideSwap is enabled by default; the `aqua sideswap` command group ships visible.
+It may be offered to users.
+
+<!-- MANUAL: -->

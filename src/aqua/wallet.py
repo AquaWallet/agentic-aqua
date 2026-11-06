@@ -1,0 +1,923 @@
+"""Wallet management using LWK."""
+
+import logging
+import re
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from typing import Callable, Optional, TypeVar, Union
+from urllib.parse import urlparse
+
+import lwk
+
+from .assets import lookup_asset, resolve_asset_name
+from .storage import Storage, WalletData
+
+logger = logging.getLogger(__name__)
+
+# Chain backends LWK can talk to; selected by ``config.electrum_url``.
+LiquidClient = Union[lwk.ElectrumClient, lwk.EsploraClient]
+
+# Per-network backend order and override semantics: docs/CONFIG.md "Liquid chain backends".
+LIQUID_BACKEND_URLS: dict[str, list[str]] = {
+    "mainnet": [
+        "https://www.streamblocks.net/liquid/api",
+        "https://airavata.aquabtc.com/liquid/api",
+        "https://blockstream.info/liquid/api",
+        "https://liquid.network/api",
+    ],
+    "testnet": [
+        "https://blockstream.info/liquidtestnet/api",
+        "https://liquid.network/liquidtestnet/api",
+    ],
+}
+
+# Per-backend concurrency rationale (own electrs vs. public instances): docs/CONFIG.md.
+OWN_ESPLORA_CONCURRENCY = 12
+PUBLIC_ESPLORA_CONCURRENCY = 3
+_OWN_ESPLORA_HOSTS = ("airavata.aquabtc.com", "www.streamblocks.net")
+
+# lwk's Esplora client has no default timeout otherwise: docs/CONFIG.md.
+ESPLORA_TIMEOUT_SECONDS = 15
+
+_T = TypeVar("_T")
+
+# Substrings of lwk's wrapped reqwest/hyper/serde error text (5xx/429: handled structurally below).
+_TRANSIENT_MARKERS = (
+    "connection reset",
+    "connection refused",
+    "connection closed",
+    "connection error",
+    "timedout",  # reqwest: source: TimedOut
+    "timed out",
+    "timeout",
+    "dns error",
+    "error sending request",
+    "incompletemessage",  # hyper: connection dropped mid-response
+    "error decoding response body",  # backend answered 200 with a non-JSON body
+    "jsonfrom",  # lwk variant for the same: serde_json choked on an error page
+    # Quoted as lwk renders it — unquoted also matches lwk's unrelated "unexpected value" message.
+    '"expected value"',
+    "failed to lookup address information",  # Electrum: DNS lookup failed
+)
+
+# Elements/Electrum "already have this tx" responses (RPC -27 via Esplora, or a mempool reject).
+_ALREADY_BROADCAST_MARKERS = (
+    "already in block chain",
+    "txn-already-in-mempool",
+    "txn-already-known",
+    "transaction already in mempool",
+)
+
+
+# Electrum "no such tx" replies: electrs ("missing transaction"), bitcoind-backed servers.
+_MISSING_TX_MARKERS = (
+    "missing transaction",
+    "no such mempool or blockchain transaction",
+)
+
+_TX_HEX_RE = re.compile(r"(?:[0-9a-fA-F]{2})+")
+
+
+class EsploraNotFound(Exception):
+    """Every backend that answered returned 404 for the requested path."""
+
+
+def _parse_tx_hex(body: str) -> str:
+    """Accept a raw transaction hex body; reject proxy pages and other 200s."""
+    tx_hex = body.strip()
+    if not _TX_HEX_RE.fullmatch(tx_hex):
+        raise ValueError("response body is not transaction hex")
+    return tx_hex
+
+
+def esplora_http_get(
+    bases: list[str],
+    path: str,
+    parse: Callable[[str], _T],
+    *,
+    timeout: int = ESPLORA_TIMEOUT_SECONDS,
+    failure_label: str = "Could not reach any Liquid Esplora backend",
+) -> _T:
+    """GET ``path`` from each Esplora base in order and return ``parse(body)``.
+
+    Shared by ``get_transaction_hex`` and ``tools._esplora_request``. Fallback
+    rules: docs/CONFIG.md "Liquid chain backends". A 404 is retried (one
+    backend lagging is not proof the resource is missing). HTTP 5xx, 429,
+    network errors, a non-UTF-8 body, and a body ``parse`` rejects are also
+    retried. Any other 4xx is the caller's request and is raised immediately.
+
+    Raises ``EsploraNotFound`` when every backend returned 404, or ``ValueError``
+    when at least one backend failed and none succeeded.
+    """
+    failures: list[str] = []
+    not_found: list[str] = []
+
+    for base in bases:
+        base = base.rstrip("/")
+        url = f"{base}/{path.lstrip('/')}"
+        req = urllib.request.Request(url, headers={"User-Agent": "agentic-aqua"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                not_found.append(base)
+                continue
+            if exc.code >= 500 or exc.code == 429:
+                failures.append(f"{base}: HTTP {exc.code}")
+                continue
+            raise ValueError(f"Esplora API error at {base}: HTTP {exc.code}") from exc
+        except OSError as exc:
+            # URLError, socket timeouts and read-phase resets are all OSError.
+            failures.append(f"{base}: {getattr(exc, 'reason', None) or exc}")
+            continue
+
+        try:
+            body = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            logger.warning("Unparseable Esplora response from %s", base)
+            failures.append(f"{base}: response body is not utf-8")
+            continue
+
+        try:
+            return parse(body)
+        except ValueError as exc:
+            logger.warning("Unparseable Esplora response from %s", base)
+            failures.append(f"{base}: {exc}")
+
+    if not failures:
+        raise EsploraNotFound()
+    detail = "; ".join(failures + [f"{base}: HTTP 404" for base in not_found])
+    raise ValueError(f"{failure_label} ({detail})")
+
+
+def _is_missing_tx_error(exc: Exception) -> bool:
+    """True when an Electrum backend says it does not have the tx (a miss, not an outage)."""
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _MISSING_TX_MARKERS)
+
+
+def _is_transient_backend_error(exc: Exception) -> bool:
+    """True when the error looks like the backend is down, not like a bad request.
+
+    Only these failures may fall back to the next backend. A rejected broadcast
+    or an invalid PSET must surface as-is (see CLAUDE.md "No silent fallbacks").
+    """
+    if isinstance(exc, lwk.LwkError.EsploraHttpError) and (
+        exc.status >= 500 or exc.status == 429
+    ):
+        # The backend (or its proxy) failed or rate-limited us, not the request.
+        return True
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _TRANSIENT_MARKERS)
+
+
+def _is_already_broadcast_error(exc: Exception) -> bool:
+    """True when the backend rejected the tx because it already has it.
+
+    A lost response after a node relayed the tx makes the retry fail this way;
+    report its txid instead of a false failure. Every other rejection still raises.
+    """
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _ALREADY_BROADCAST_MARKERS)
+
+
+def _esplora_concurrency(url: str) -> int:
+    """Parallel request budget for an Esplora backend, by host."""
+    host = (urlparse(url).hostname or "").lower()
+    if host in _OWN_ESPLORA_HOSTS:
+        return OWN_ESPLORA_CONCURRENCY
+    return PUBLIC_ESPLORA_CONCURRENCY
+
+
+@dataclass
+class Balance:
+    """Wallet balance."""
+
+    asset_id: str
+    asset_name: str
+    ticker: str
+    amount: int  # In satoshis (smallest unit)
+    precision: int = 8  # Decimal places
+    logo: Optional[str] = None
+
+    @property
+    def value(self) -> float:
+        """Human-readable amount (e.g. 100_000_000 sats with precision=8 -> 1.0)."""
+        return self.amount / (10**self.precision)
+
+    def to_dict(self) -> dict:
+        d = {
+            "asset_id": self.asset_id,
+            "asset_name": self.asset_name,
+            "ticker": self.ticker,
+            "amount_sats": self.amount,
+            "precision": self.precision,
+            "value": self.value,
+        }
+        if self.logo:
+            d["logo"] = self.logo
+        return d
+
+
+@dataclass
+class Address:
+    """Wallet address."""
+
+    address: str
+    index: int
+
+    def to_dict(self) -> dict:
+        return {
+            "address": self.address,
+            "index": self.index,
+        }
+
+
+@dataclass
+class Transaction:
+    """Transaction info."""
+
+    txid: str
+    height: Optional[int]
+    timestamp: Optional[int]
+    balance: dict[str, int]  # asset_id -> amount change
+    fee: int
+
+    def to_dict(self) -> dict:
+        return {
+            "txid": self.txid,
+            "height": self.height,
+            "timestamp": self.timestamp,
+            "balance": self.balance,
+            "fee": self.fee,
+        }
+
+
+class WalletManager:
+    """Manages Liquid wallets using LWK."""
+
+    def __init__(self, storage: Optional[Storage] = None):
+        self.storage = storage or Storage()
+        self._signers: dict[str, lwk.Signer] = {}
+        self._wollets: dict[str, lwk.Wollet] = {}
+        self._clients: dict[tuple[str, str], LiquidClient] = {}
+
+    def _get_network(self, network: str) -> lwk.Network:
+        """Get LWK network object."""
+        if network == "mainnet":
+            return lwk.Network.mainnet()
+        elif network == "testnet":
+            return lwk.Network.testnet()
+        else:
+            raise ValueError(f"Unknown network: {network}")
+
+    def _backend_urls(self, network: str) -> list[str]:
+        """Backends to try, in order. An explicit config override wins outright."""
+        override = (self.storage.load_config().electrum_url or "").strip()
+        if override:
+            return [override]
+        if network not in LIQUID_BACKEND_URLS:
+            raise ValueError(f"Unknown network: {network}")
+        return list(LIQUID_BACKEND_URLS[network])
+
+    def _build_client(self, url: str, net: lwk.Network) -> LiquidClient:
+        """Build a chain client from a URL — scheme picks Esplora vs. Electrum (docs/CONFIG.md)."""
+        if url.startswith(("http://", "https://")):
+            concurrency = _esplora_concurrency(url)
+            logger.info("Using Esplora backend %s (concurrency=%d)", url, concurrency)
+            return lwk.EsploraClient.from_builder(
+                lwk.EsploraClientBuilder(
+                    base_url=url,
+                    network=net,
+                    concurrency=concurrency,
+                    timeout=ESPLORA_TIMEOUT_SECONDS,
+                )
+            )
+        tls = url.startswith("ssl://")
+        endpoint = url.split("://", 1)[-1]
+        logger.info("Using Electrum backend %s (tls=%s)", endpoint, tls)
+        return lwk.ElectrumClient(endpoint, tls=tls, validate_domain=tls)
+
+    def _get_client(self, network: str, url: str) -> LiquidClient:
+        """Cached chain client for one backend URL."""
+        key = (network, url)
+        if key not in self._clients:
+            self._clients[key] = self._build_client(url, self._get_network(network))
+        return self._clients[key]
+
+    def _with_client_fallback(
+        self, network: str, fn: Callable[[LiquidClient], _T]
+    ) -> _T:
+        """Run ``fn`` against each backend in turn, falling back on network errors.
+
+        Backends are read once per call (one config snapshot) and built lazily
+        inside the loop, so one bad Electrum constructor can't block the rest.
+        """
+        last_exc: Optional[Exception] = None
+        for url in self._backend_urls(network):
+            try:
+                client = self._get_client(network, url)
+            except Exception as exc:
+                # A build failure isn't a fn error — never short-circuits like a non-transient one.
+                logger.warning("Liquid backend %s unusable (%s)", url, exc)
+                last_exc = exc
+                continue
+            try:
+                return fn(client)
+            except Exception as exc:
+                if not _is_transient_backend_error(exc):
+                    raise
+                logger.warning("Liquid backend %s unreachable (%s)", url, exc)
+                last_exc = exc
+        assert last_exc is not None
+        raise last_exc
+
+    def _broadcast(self, network: str, tx: lwk.Transaction) -> str:
+        """Broadcast ``tx`` with backend fallback. Returns the txid.
+
+        A retry can find the previous attempt's tx already relayed; report its
+        txid instead of failing a transaction the network already accepted.
+        """
+
+        def attempt(client: LiquidClient) -> str:
+            try:
+                return str(client.broadcast(tx))
+            except Exception as exc:
+                if not _is_already_broadcast_error(exc):
+                    raise
+                logger.info("Backend already has the tx (%s)", exc)
+                return str(tx.txid())
+
+        return self._with_client_fallback(network, attempt)
+
+    def _get_policy_asset(self, network: str) -> str:
+        """Get L-BTC asset ID for network."""
+        return str(self._get_network(network).policy_asset())
+
+    # Chain access that is independent of any one wallet
+
+    def get_block_height(self, network: str = "mainnet") -> int:
+        """Current Liquid chain tip height."""
+        return self._with_client_fallback(network, lambda c: c.tip().height())
+
+    def get_transaction_hex(self, txid: str, network: str = "mainnet") -> str:
+        """Fetch a transaction from the chain, as raw hex.
+
+        lwk's EsploraClient has no get_tx, so HTTP backends go through
+        ``esplora_http_get`` (the same fallback ``lw_tx_status`` uses).
+        ``electrum_url`` replaces that list with one endpoint; a non-HTTP
+        override is read with Electrum ``get_tx``.
+        """
+        urls = self._backend_urls(network)
+        if urls and not urls[0].startswith(("http://", "https://")):
+            return self._electrum_transaction_hex(network, urls[0], txid)
+        try:
+            return esplora_http_get(
+                urls,
+                f"tx/{txid}/hex",
+                _parse_tx_hex,
+                failure_label=f"Could not reach any Liquid backend for {txid}",
+            )
+        except EsploraNotFound:
+            raise ValueError(f"Transaction {txid} not found on {network}") from None
+
+    def _electrum_transaction_hex(self, network: str, url: str, txid: str) -> str:
+        """Raw tx hex from one Electrum backend.
+
+        lwk's ``get_tx`` raises on a miss instead of returning None. A miss is
+        "not found"; a connection failure is "could not reach". Anything else
+        (a bad request) propagates unchanged.
+        """
+        try:
+            tx = self._get_client(network, url).get_tx(lwk.Txid(txid))
+        except Exception as exc:
+            if _is_missing_tx_error(exc):
+                raise ValueError(f"Transaction {txid} not found on {network}") from None
+            if not _is_transient_backend_error(exc):
+                raise
+            raise ValueError(
+                f"Could not reach any Liquid backend for {txid} ({url}: {exc})"
+            ) from exc
+        if tx is None:
+            raise ValueError(f"Transaction {txid} not found on {network}")
+        return str(tx)
+
+    def broadcast_raw_tx(self, tx_hex: str, network: str = "mainnet") -> str:
+        """Broadcast an already-signed raw transaction and return its txid."""
+        return self._broadcast(network, lwk.Transaction(tx_hex))
+
+    # Mnemonic operations
+
+    def generate_mnemonic(self) -> str:
+        """Generate a new BIP39 mnemonic (12 words)."""
+        network = lwk.Network.mainnet()  # Network doesn't matter for mnemonic gen
+        signer = lwk.Signer.random(network)
+        return str(signer.mnemonic())
+
+    def import_mnemonic(
+        self,
+        mnemonic: str,
+        wallet_name: str = "default",
+        network: str = "mainnet",
+        password: Optional[str] = None,
+    ) -> WalletData:
+        """Import wallet from mnemonic.
+
+        ``password`` is used only to encrypt the mnemonic at rest.
+        The derived Liquid descriptor depends solely on the mnemonic.
+        """
+        if self.storage.wallet_exists(wallet_name):
+            raise ValueError(f"Wallet '{wallet_name}' already exists")
+
+        # Create signer and get descriptor
+        net = self._get_network(network)
+        lwk_mnemonic = lwk.Mnemonic(mnemonic)
+        signer = lwk.Signer(lwk_mnemonic, net)
+        descriptor = str(signer.wpkh_slip77_descriptor())
+
+        encrypted = self.storage.store_mnemonic(mnemonic, password)
+
+        # Create and save wallet
+        wallet = WalletData(
+            name=wallet_name,
+            network=network,
+            descriptor=descriptor,
+            encrypted_mnemonic=encrypted,
+            watch_only=False,
+        )
+        self.storage.save_wallet(wallet)
+
+        # Cache signer
+        self._signers[wallet_name] = signer
+
+        return wallet
+
+    def import_descriptor(
+        self,
+        descriptor: str,
+        wallet_name: str,
+        network: str = "mainnet",
+    ) -> WalletData:
+        """Import watch-only wallet from CT descriptor."""
+        if self.storage.wallet_exists(wallet_name):
+            raise ValueError(f"Wallet '{wallet_name}' already exists")
+
+        wallet = WalletData(
+            name=wallet_name,
+            network=network,
+            descriptor=descriptor,
+            watch_only=True,
+        )
+        self.storage.save_wallet(wallet)
+        return wallet
+
+    def export_descriptor(self, wallet_name: str) -> str:
+        """Export CT descriptor for wallet."""
+        wallet = self.storage.load_wallet(wallet_name)
+        if not wallet:
+            raise ValueError(f"Wallet '{wallet_name}' not found")
+        return wallet.descriptor
+
+    def load_wallet(
+        self,
+        wallet_name: str,
+        password: Optional[str] = None,
+    ) -> WalletData:
+        """Load wallet, optionally decrypting mnemonic."""
+        wallet = self.storage.load_wallet(wallet_name)
+        if not wallet:
+            raise ValueError(f"Wallet '{wallet_name}' not found")
+
+        if wallet.encrypted_mnemonic:
+            needs_password = self.storage.requires_user_password(wallet.encrypted_mnemonic)
+            if not needs_password or password:
+                mnemonic = self.storage.read_and_migrate_mnemonic(wallet, password)
+                net = self._get_network(wallet.network)
+                lwk_mnemonic = lwk.Mnemonic(mnemonic)
+                self._signers[wallet_name] = lwk.Signer(lwk_mnemonic, net)
+
+        return wallet
+
+    def _get_wollet(self, wallet_name: str) -> lwk.Wollet:
+        """Get or create Wollet for wallet."""
+        if wallet_name not in self._wollets:
+            wallet = self.storage.load_wallet(wallet_name)
+            if not wallet:
+                raise ValueError(f"Wallet '{wallet_name}' not found")
+
+            net = self._get_network(wallet.network)
+            desc = lwk.WolletDescriptor(wallet.descriptor)
+            cache_dir = str(self.storage.get_cache_path(wallet_name))
+            self._wollets[wallet_name] = lwk.Wollet(net, desc, datadir=cache_dir)
+
+        return self._wollets[wallet_name]
+
+    def sync_wallet(self, wallet_name: str):
+        """Sync wallet via full_scan_to_index(next_address_index + 1).
+
+        Covers off-chain handed-out addresses that lwk's default gap limit would miss.
+        """
+        wallet = self.storage.load_wallet(wallet_name)
+        if not wallet:
+            raise ValueError(f"Wallet '{wallet_name}' not found")
+
+        wollet = self._get_wollet(wallet_name)
+        update = self._with_client_fallback(
+            wallet.network,
+            lambda c: c.full_scan_to_index(wollet, wallet.next_address_index + 1),
+        )
+        if update:
+            wollet.apply_update(update)
+
+    # Wallet operations
+
+    def get_balance(self, wallet_name: str) -> list[Balance]:
+        """Get wallet balance."""
+        wallet = self.storage.load_wallet(wallet_name)
+        if not wallet:
+            raise ValueError(f"Wallet '{wallet_name}' not found")
+
+        self.sync_wallet(wallet_name)
+        wollet = self._get_wollet(wallet_name)
+        raw_balance = wollet.balance()
+
+        policy_asset = self._get_policy_asset(wallet.network)
+        balances = []
+
+        for asset_id, amount in raw_balance.items():
+            info = lookup_asset(asset_id, wallet.network)
+            if info:
+                name = info.name
+                ticker = info.ticker
+                logo = info.logo
+                precision = info.precision
+            else:
+                name = "L-BTC" if asset_id == policy_asset else asset_id[:8] + "..."
+                ticker = "L-BTC" if asset_id == policy_asset else asset_id[:8] + "..."
+                logo = None
+                precision = 8  # Default for Liquid assets
+            balances.append(
+                Balance(
+                    asset_id=asset_id,
+                    asset_name=name,
+                    ticker=ticker,
+                    amount=amount,
+                    precision=precision,
+                    logo=logo,
+                )
+            )
+
+        return balances
+
+    def get_address(
+        self,
+        wallet_name: str,
+        index: Optional[int] = None,
+    ) -> Address:
+        """Get a receive address.
+
+        No-arg advances ``next_address_index`` (not idempotent). Explicit
+        ``index`` returns it without advancing; for display use :meth:`peek_address`.
+        """
+        if index is None:
+            # The load/derive/advance/save sequence lives once, in reserve_addresses.
+            return self.reserve_addresses(wallet_name, 1)[0]
+        wollet = self._get_wollet(wallet_name)
+        addr = wollet.address(index)
+        return Address(address=str(addr.address()), index=addr.index())
+
+    def reserve_addresses(
+        self,
+        wallet_name: str,
+        count: int,
+    ) -> list[Address]:
+        """Hand out ``count`` fresh receive addresses, advancing the persisted counter in one save.
+
+        Batched equivalent of calling ``get_address`` ``count`` times.
+        """
+        if count <= 0:
+            raise ValueError("count must be positive")
+        wollet = self._get_wollet(wallet_name)
+        # Hold the cross-process lock so two writers can't hand out the same index.
+        with self.storage.wallet_lock(wallet_name):
+            wallet_record = self.storage.load_wallet(wallet_name)
+            if wallet_record is None:
+                raise ValueError(f"Wallet {wallet_name!r} not found")
+            lwk_tip = wollet.address(None).index()
+            start = max(lwk_tip, wallet_record.next_address_index)
+            addresses: list[Address] = []
+            for offset in range(count):
+                addr = wollet.address(start + offset)
+                addresses.append(
+                    Address(address=str(addr.address()), index=addr.index())
+                )
+            wallet_record.next_address_index = start + count
+            self.storage.save_wallet(wallet_record)
+        return addresses
+
+    def ensure_counter_covers(
+        self,
+        wallet_name: str,
+        addresses: list[str],
+    ) -> int:
+        """Bump ``next_address_index`` past any of ``addresses`` this wallet derives.
+
+        Best-effort repair for a reset counter (e.g. seed reimport) so the frontier
+        never re-hands out indices the server already delivered to.
+        """
+        targets = set(addresses)
+        wollet = self._get_wollet(wallet_name)
+        with self.storage.wallet_lock(wallet_name):
+            wallet_record = self.storage.load_wallet(wallet_name)
+            if wallet_record is None:
+                raise ValueError(f"Wallet {wallet_name!r} not found")
+            if not targets:
+                return wallet_record.next_address_index
+            lwk_tip = wollet.address(None).index()
+            frontier = max(lwk_tip, wallet_record.next_address_index)
+            # Server-side pool batches are capped, so matches sit within a modest window.
+            horizon = frontier + 100
+            max_matched = -1
+            for i in range(horizon):
+                if str(wollet.address(i).address()) in targets:
+                    max_matched = i
+            if max_matched + 1 > wallet_record.next_address_index:
+                logger.info(
+                    "Wallet %r: advancing next_address_index %d -> %d to cover "
+                    "server-known pool addresses (counter was behind, e.g. "
+                    "after a seed reimport).",
+                    wallet_name,
+                    wallet_record.next_address_index,
+                    max_matched + 1,
+                )
+                wallet_record.next_address_index = max_matched + 1
+                self.storage.save_wallet(wallet_record)
+            return wallet_record.next_address_index
+
+    def peek_address(
+        self,
+        wallet_name: str,
+        index: Optional[int] = None,
+    ) -> Address:
+        """Return a receive address for display without advancing the counter or writing to disk.
+
+        Without ``index``, returns the frontier (max of lwk tip and ``next_address_index``).
+        """
+
+        wollet = self._get_wollet(wallet_name)
+        if index is not None:
+            addr = wollet.address(index)
+            return Address(address=str(addr.address()), index=addr.index())
+        wallet_record = self.storage.load_wallet(wallet_name)
+        if wallet_record is None:
+            raise ValueError(f"Wallet {wallet_name!r} not found")
+        lwk_tip = wollet.address(None).index()
+        frontier = max(lwk_tip, wallet_record.next_address_index)
+        addr = wollet.address(frontier)
+        return Address(address=str(addr.address()), index=addr.index())
+
+    def fingerprint(
+        self,
+        wallet_name: str,
+        password: Optional[str] = None,
+    ) -> str:
+        """Return the BIP32 master fingerprint (8 hex chars) for ``wallet_name``.
+
+        Hot wallets: from the LWK signer. Watch-only: parsed from the
+        ``[fp/derivation]`` block in the descriptor.
+        """
+        if wallet_name in self._signers:
+            return self._signers[wallet_name].fingerprint()
+
+        # Decrypts and caches the signer in self._signers as a side effect.
+        wallet = self.load_wallet(wallet_name, password=password)
+        if wallet_name in self._signers:
+            return self._signers[wallet_name].fingerprint()
+
+        # Watch-only: best-effort parse of the [fp/derivation]xpub block.
+        from .bitcoin import _extract_xpub_metadata
+
+        meta = _extract_xpub_metadata(wallet.descriptor)
+        fp = meta.get("fingerprint")
+        if not fp:
+            raise ValueError(
+                f"Cannot determine fingerprint for watch-only wallet {wallet_name!r}: "
+                "descriptor has no [fingerprint/derivation] block."
+            )
+        return fp
+
+    def get_transactions(
+        self,
+        wallet_name: str,
+        limit: Optional[int] = None,
+    ) -> list[Transaction]:
+        """Get transaction history."""
+        wallet = self.storage.load_wallet(wallet_name)
+        if not wallet:
+            raise ValueError(f"Wallet '{wallet_name}' not found")
+
+        self.sync_wallet(wallet_name)
+        wollet = self._get_wollet(wallet_name)
+
+        txs = wollet.transactions()
+        if limit:
+            txs = txs[:limit]
+
+        result = []
+        for tx in txs:
+            balance = {}
+            for asset_id, amount in tx.balance().items():
+                ticker = resolve_asset_name(asset_id, wallet.network)
+                balance[ticker] = {"asset_id": asset_id, "amount": amount}
+
+            result.append(
+                Transaction(
+                    txid=str(tx.txid()),
+                    height=tx.height(),
+                    timestamp=tx.timestamp(),
+                    balance=balance,
+                    fee=tx.fee() or 0,
+                )
+            )
+
+        return result
+
+    def send(
+        self,
+        wallet_name: str,
+        address: str,
+        amount: int,
+        asset_id: Optional[str] = None,
+        password: Optional[str] = None,
+    ) -> str:
+        """Send transaction. Returns txid."""
+        wallet = self.storage.load_wallet(wallet_name)
+        if not wallet:
+            raise ValueError(f"Wallet '{wallet_name}' not found")
+
+        if wallet.watch_only:
+            raise ValueError("Cannot sign with watch-only wallet")
+
+        if amount <= 0:
+            raise ValueError("Amount must be positive")
+
+        if wallet_name not in self._signers:
+            if not wallet.encrypted_mnemonic:
+                raise ValueError("No mnemonic available for signing")
+            needs_password = self.storage.requires_user_password(wallet.encrypted_mnemonic)
+            if needs_password and not password:
+                raise ValueError("Password required to decrypt mnemonic")
+            self.load_wallet(wallet_name, password)
+
+        signer = self._signers[wallet_name]
+        wollet = self._get_wollet(wallet_name)
+        net = self._get_network(wallet.network)
+
+        # Sync first
+        self.sync_wallet(wallet_name)
+
+        # Build transaction
+        builder = net.tx_builder()
+        lwk_address = lwk.Address(address)
+
+        if asset_id:
+            builder.add_recipient(lwk_address, amount, asset_id)
+        else:
+            builder.add_lbtc_recipient(lwk_address, amount)
+
+        unsigned_pset = builder.finish(wollet)
+        signed_pset = signer.sign(unsigned_pset)
+        tx = signed_pset.finalize()
+
+        # Broadcast
+        return self._broadcast(wallet.network, tx)
+
+    def sweep(
+        self,
+        wallet_name: str,
+        address: str,
+        asset_id: Optional[str] = None,
+        password: Optional[str] = None,
+    ) -> str:
+        """Sweep a wallet balance to a single address. Returns txid.
+
+        With ``asset_id`` omitted (or set to the network's L-BTC policy asset),
+        spends every L-BTC input and routes the remainder to ``address`` — the
+        on-chain fee is paid from those inputs, so 0 L-BTC remains in the
+        wallet afterwards. (Wraps LWK's ``drain_lbtc_*`` builder API.)
+
+        With ``asset_id`` set to a non-L-BTC asset, sends the entire balance of
+        that asset to ``address``. The on-chain fee is still paid in L-BTC, so
+        L-BTC change may be returned to the wallet — call ``sweep`` again
+        without ``asset_id`` to also sweep the L-BTC remainder.
+        """
+        wallet = self.storage.load_wallet(wallet_name)
+        if not wallet:
+            raise ValueError(f"Wallet '{wallet_name}' not found")
+
+        if wallet.watch_only:
+            raise ValueError("Cannot sign with watch-only wallet")
+
+        if wallet_name not in self._signers:
+            if not wallet.encrypted_mnemonic:
+                raise ValueError("No mnemonic available for signing")
+            needs_password = self.storage.requires_user_password(wallet.encrypted_mnemonic)
+            if needs_password and not password:
+                raise ValueError("Password required to decrypt mnemonic")
+            self.load_wallet(wallet_name, password)
+
+        signer = self._signers[wallet_name]
+        wollet = self._get_wollet(wallet_name)
+        net = self._get_network(wallet.network)
+        policy_asset = self._get_policy_asset(wallet.network)
+
+        # An explicit policy-asset id is just an L-BTC sweep — collapse to
+        # the L-BTC path so callers can pass either spelling.
+        if asset_id == policy_asset:
+            asset_id = None
+
+        self.sync_wallet(wallet_name)
+        raw_balance = wollet.balance()
+
+        builder = net.tx_builder()
+        lwk_address = lwk.Address(address)
+
+        if asset_id is None:
+            lbtc_balance = int(raw_balance.get(policy_asset, 0))
+            if lbtc_balance <= 0:
+                raise ValueError("No L-BTC to sweep")
+            builder.drain_lbtc_wallet()
+            builder.drain_lbtc_to(lwk_address)
+        else:
+            asset_balance = int(raw_balance.get(asset_id, 0))
+            if asset_balance <= 0:
+                ticker = resolve_asset_name(asset_id, wallet.network)
+                raise ValueError(f"No {ticker} balance to sweep")
+            builder.add_recipient(lwk_address, asset_balance, asset_id)
+
+        unsigned_pset = builder.finish(wollet)
+        signed_pset = signer.sign(unsigned_pset)
+        tx = signed_pset.finalize()
+
+        return self._broadcast(wallet.network, tx)
+
+    def craft_raw_tx(
+        self,
+        wallet_name: str,
+        address: str,
+        amount: int,
+        asset_id: Optional[str] = None,
+        password: Optional[str] = None,
+    ) -> str:
+        """Build, sign, finalize a Liquid tx. Returns hex; does NOT broadcast.
+
+        Used when a third party (JAN3 Ankara backend, etc.) wants to broadcast
+        on our behalf. Branches on whether the destination address is
+        confidential (blinded) or explicit (unblinded), since LWK's tx builder
+        exposes different methods for each.
+        """
+        wallet = self.storage.load_wallet(wallet_name)
+        if not wallet:
+            raise ValueError(f"Wallet '{wallet_name}' not found")
+
+        if wallet.watch_only:
+            raise ValueError("Cannot sign with watch-only wallet")
+
+        if amount <= 0:
+            raise ValueError("Amount must be positive")
+
+        if wallet_name not in self._signers:
+            if not wallet.encrypted_mnemonic:
+                raise ValueError("No mnemonic available for signing")
+            needs_password = self.storage.requires_user_password(wallet.encrypted_mnemonic)
+            if needs_password and not password:
+                raise ValueError("Password required to decrypt mnemonic")
+            self.load_wallet(wallet_name, password)
+
+        signer = self._signers[wallet_name]
+        wollet = self._get_wollet(wallet_name)
+        net = self._get_network(wallet.network)
+        policy_asset_id = self._get_policy_asset(wallet.network)
+
+        self.sync_wallet(wallet_name)
+
+        builder = net.tx_builder()
+        lwk_address = lwk.Address(address)
+        effective_asset_id = asset_id or policy_asset_id
+
+        if lwk_address.is_blinded():
+            if effective_asset_id == policy_asset_id:
+                builder.add_lbtc_recipient(lwk_address, amount)
+            else:
+                builder.add_recipient(lwk_address, amount, effective_asset_id)
+        else:
+            builder.add_explicit_recipient(lwk_address, amount, effective_asset_id)
+
+        pset = builder.finish(wollet)
+        # Populate wallet-aware details (e.g. input/output values) so callers
+        # can introspect the PSET before handing the hex off.
+        pset = wollet.add_details(pset)
+        signed_pset = signer.sign(pset)
+        return str(signed_pset.finalize())
